@@ -529,6 +529,16 @@ def main():
     if not TG_TOKEN or not TG_CHAT_ID:
         log.warning("⚠ TG_TOKEN sau TG_CHAT_ID nu sunt setate — alertele nu vor fi trimise!")
 
+    # TEST_PING=1 → trimite un mesaj de test și ieși (verificare livrare Telegram).
+    if os.environ.get("TEST_PING", "").lower() in ("1", "true"):
+        ok = send_telegram(
+            "✅ <b>Test crypto-scanner</b>\n"
+            "Scannerul e conectat și rulează pe GitHub Actions.\n"
+            "Vei primi: 📊 alerte CONTEXT (confluence) și 🎯 alerte SETUP (SFP)."
+        )
+        log.info(f"Mesaj de test trimis: {ok}")
+        return
+
     if RUN_ONCE:
         # Cron / GitHub Actions: încarcă starea, o trecere, salvează, ieși.
         load_state()

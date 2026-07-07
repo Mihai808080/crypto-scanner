@@ -5,7 +5,12 @@ name: crypto-scan
 on:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      test_ping:
+        description: "Trimite un mesaj de test pe Telegram"
+        type: boolean
+        default: false
 
 # Nu porni o rulare nouă dacă una e încă în curs (evită suprapuneri).
 concurrency:
@@ -38,6 +43,7 @@ jobs:
       - name: Run one scan pass
         env:
           RUN_ONCE: "1"
+          TEST_PING: ${{ inputs.test_ping }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           MIN_SCORE: "65"
