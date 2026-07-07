@@ -1,0 +1,45 @@
+name: crypto-scan
+
+# Rulează scannerul la fiecare 5 minute + buton manual pentru test.
+# NOTĂ: cron-ul GitHub poate întârzia 5-15 min sub încărcare — normal pt. free.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+# Nu porni o rulare nouă dacă una e încă în curs (evită suprapuneri).
+concurrency:
+  group: crypto-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Restaurează starea anti-spam din ultima rulare (cheie cu prefix).
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: scan_state.json
+          key: scan-state-${{ github.run_id }}
+          restore-keys: |
+            scan-state-
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run one scan pass
+        env:
+          RUN_ONCE: "1"
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          MIN_SCORE: "65"
+          SFP_SYMBOLS: "DOGEUSDT,SOLUSDT"
+        run: python scanner.py

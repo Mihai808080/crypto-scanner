@@ -1,0 +1,6 @@
+# Watchlist confluence (alerte de CONTEXT — informativ).
+# Un simbol pe linie. SFP-ul (alerte de SETUP) rulează separat pe SFP_SYMBOLS.
+BTCUSDT
+ETHUSDT
+SOLUSDT
+DOGEUSDT
