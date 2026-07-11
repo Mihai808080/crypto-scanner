@@ -38,6 +38,14 @@ SFP_SYMBOLS = [
 # RUN_ONCE=1 → o singură trecere apoi ieși (pentru cron / GitHub Actions).
 # Gol/0 → bucla clasică while-True (pentru rulare pe server always-on / local).
 RUN_ONCE = os.environ.get("RUN_ONCE", "") == "1"
+# Alerte de preț definite de user din UI, stocate în Netlify Blobs.
+# ALERTS_URL = https://<site>.netlify.app/api/alerts ; ALERTS_KEY = CI_ALERT_KEY.
+# Goale → funcția e sărită (nimic nu se strică dacă nu sunt setate).
+ALERTS_URL = os.environ.get("ALERTS_URL", "")
+ALERTS_KEY = os.environ.get("ALERTS_KEY", "")
+# Watchlist din cloud (Netlify Blobs) — listă de {sym, cat, strat} scrisă din UI.
+# Gol → fallback la watchlist.txt (toate pe strategia 'conf').
+WATCHLIST_URL = os.environ.get("WATCHLIST_URL", "")
 # Fișier de stare persistat între rulări (anti-spam). Pe GitHub Actions e
 # restaurat/salvat prin actions/cache; local e doar un fișier lângă scanner.
 STATE_FILE = os.environ.get("STATE_FILE", "scan_state.json")
@@ -46,6 +54,7 @@ BINANCE_BASE = "https://fapi.binance.com/fapi/v1"
 
 # Anti-spam: ultima direcție/alertă trimisă per simbol
 state = {}  # { "BTCUSDT": {"prev_dir": 0, "last_alert_ts": 0} }
+sweep_state = {}  # anti-spam separat pentru alertele de Liquidity Sweep
 
 
 # ─────────────────────────────────────────────
@@ -59,6 +68,7 @@ def load_state():
         with open(STATE_FILE) as f:
             data = json.load(f)
         state.update(data.get("confluence", {}))
+        sweep_state.update(data.get("sweep", {}))
         sfp._alerted.update(data.get("sfp", {}))
         log.info(f"Stare încărcată din {STATE_FILE}")
     except Exception as e:
@@ -69,7 +79,7 @@ def save_state():
     """Salvează starea anti-spam în STATE_FILE."""
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"confluence": state, "sfp": sfp._alerted}, f)
+            json.dump({"confluence": state, "sweep": sweep_state, "sfp": sfp._alerted}, f)
     except Exception as e:
         log.error(f"Nu am putut salva starea: {e}")
 
@@ -113,6 +123,14 @@ def get_ticker(symbol):
     r.raise_for_status()
     d = r.json()
     return float(d["lastPrice"]), float(d["priceChangePercent"])
+
+
+def get_price(symbol):
+    """Doar ultimul preț — pentru alertele de preț ale userului."""
+    url = f"{BINANCE_BASE}/ticker/price"
+    r = requests.get(url, params={"symbol": symbol}, timeout=10)
+    r.raise_for_status()
+    return float(r.json()["price"])
 
 
 # ─────────────────────────────────────────────
@@ -506,14 +524,299 @@ def scan_symbol(symbol):
         log.error(f"Eroare la scanarea {symbol}: {e}")
 
 
+# ─────────────────────────────────────────────
+# LIQUIDITY SWEEP (SFP) — port 1:1 din src/lib/confluence.js (sweepSignal)
+# Aceeași logică ca în browser (Watchlist), ca semnalul să fie identic.
+# ─────────────────────────────────────────────
+def htf_trend_dir(kl4h):
+    if not kl4h or len(kl4h) < 21:
+        return 0
+    closes = [k["c"] for k in kl4h]
+    e21 = ema(closes, 21)[-1]
+    price = closes[-1]
+    return 1 if price > e21 else -1 if price < e21 else 0
+
+
+def find_pivots(kl, k=3):
+    """Pivoturi confirmate: extremă strictă pe j±k."""
+    lows, highs = [], []
+    for j in range(k, len(kl) - k):
+        is_low = is_high = True
+        for m in range(j - k, j + k + 1):
+            if m == j:
+                continue
+            if kl[m]["l"] <= kl[j]["l"]:
+                is_low = False
+            if kl[m]["h"] >= kl[j]["h"]:
+                is_high = False
+            if not is_low and not is_high:
+                break
+        if is_low:
+            lows.append({"idx": j, "level": kl[j]["l"]})
+        if is_high:
+            highs.append({"idx": j, "level": kl[j]["h"]})
+    return lows, highs
+
+
+def detect_sweep(kl, pivot_k=3, lookback=80, confirm_window=8, recent_bars=0):
+    """Sweep confirmat fără lookahead (vezi comentariile din confluence.js)."""
+    n = len(kl)
+    i = n - 1
+    if n < lookback + pivot_k * 2 + 5:
+        return None
+    frm = max(0, i - lookback - recent_bars)
+    lows, highs = find_pivots(kl[frm:i + 1], pivot_k)
+    for p in lows:
+        p["idx"] += frm
+    for p in highs:
+        p["idx"] += frm
+
+    def scan_at(direction, f):
+        pivots = lows if direction == 1 else highs
+        s = f - 1
+        while s >= f - confirm_window and s > frm:
+            for p in range(len(pivots) - 1, -1, -1):
+                j, level = pivots[p]["idx"], pivots[p]["level"]
+                if j + pivot_k >= s:
+                    continue
+                if f - j > lookback:
+                    break
+                bs = kl[s]
+                swept = (bs["l"] < level and bs["c"] > level) if direction == 1 \
+                    else (bs["h"] > level and bs["c"] < level)
+                if not swept:
+                    continue
+                spent = False
+                for m in range(j + 1, s):
+                    if (kl[m]["c"] < level) if direction == 1 else (kl[m]["c"] > level):
+                        spent = True
+                        break
+                if spent:
+                    continue
+                holds, first = True, True
+                for m in range(s + 1, f + 1):
+                    if (kl[m]["l"] < bs["l"]) if direction == 1 else (kl[m]["h"] > bs["h"]):
+                        holds = False
+                        break
+                    if m < f and ((kl[m]["c"] > bs["h"]) if direction == 1 else (kl[m]["c"] < bs["l"])):
+                        first = False
+                        break
+                if not holds or not first:
+                    continue
+                confirmed = (kl[f]["c"] > bs["h"]) if direction == 1 else (kl[f]["c"] < bs["l"])
+                if not confirmed:
+                    continue
+                return {
+                    "dir": direction, "level": level, "sweepIdx": s,
+                    "sweepExtreme": bs["l"] if direction == 1 else bs["h"],
+                }
+            s -= 1
+        return None
+
+    f = i
+    while f >= i - recent_bars and f > 0:
+        sw = scan_at(1, f) or scan_at(-1, f)
+        if sw:
+            alive = True
+            for m in range(f + 1, i + 1):
+                if sw["dir"] == 1:
+                    ok = kl[m]["l"] >= sw["sweepExtreme"] and kl[m]["c"] > sw["level"]
+                else:
+                    ok = kl[m]["h"] <= sw["sweepExtreme"] and kl[m]["c"] < sw["level"]
+                if not ok:
+                    alive = False
+                    break
+            if alive:
+                return sw
+        f -= 1
+    return None
+
+
+def prev_month_dir(kl4h, ts):
+    if not kl4h:
+        return 0
+    d = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+    m_start = datetime(d.year, d.month, 1, tzinfo=timezone.utc).timestamp() * 1000
+    py, pm = (d.year - 1, 12) if d.month == 1 else (d.year, d.month - 1)
+    p_start = datetime(py, pm, 1, tzinfo=timezone.utc).timestamp() * 1000
+    prev = [k for k in kl4h if p_start <= k["t"] < m_start]
+    if len(prev) < 100:
+        return 0
+    o, c = prev[0]["o"], prev[-1]["c"]
+    return 1 if c > o else -1 if c < o else 0
+
+
+def sweep_signal(kl, kl4h, bar_ts=None):
+    """Scor 0-100 pentru un sweep confirmat la ultima bară, sau None."""
+    sw = detect_sweep(kl)
+    if not sw:
+        return None
+    direction, level = sw["dir"], sw["level"]
+    sweep_idx, sweep_extreme = sw["sweepIdx"], sw["sweepExtreme"]
+    price = kl[-1]["c"]
+    total = 40  # evenimentul în sine
+
+    atr_arr = calc_atr(kl, 14)
+    atr_abs = (atr_arr[sweep_idx] if sweep_idx < len(atr_arr) else 0) or (atr_arr[-1] if atr_arr else 0)
+    depth = (level - sweep_extreme) if direction == 1 else (sweep_extreme - level)
+    if atr_abs > 0 and depth >= 0.5 * atr_abs:
+        total += 10
+
+    if sweep_idx >= 21:
+        vols = [k["v"] for k in kl[sweep_idx - 20:sweep_idx]]
+        avg_v = sum(vols) / len(vols) if vols else 0
+        if avg_v and kl[sweep_idx]["v"] >= 1.3 * avg_v:
+            total += 10
+
+    r = rsi([k["c"] for k in kl[:sweep_idx + 1]], 14)[-1]
+    if (direction == 1 and r < 35) or (direction == -1 and r > 65):
+        total += 10
+
+    if htf_trend_dir(kl4h) == direction:
+        total += 15
+
+    if bar_ts:
+        dom = datetime.fromtimestamp(bar_ts / 1000, tz=timezone.utc).day
+        pm = prev_month_dir(kl4h, bar_ts)
+        if dom <= 12 and pm != 0 and pm == -direction:
+            total += 15
+
+    return {"score": min(100, total), "dir": direction}
+
+
+def build_sweep_message(symbol, sig, price):
+    is_long = sig["dir"] == 1
+    disp = symbol.replace("USDT", "/USDT")
+    return (
+        f"🎯 <b>LIQUIDITY SWEEP</b>\n"
+        f"⚡ <b>{disp}</b> · 15m\n\n"
+        f"{'▲' if is_long else '▼'} <b>{'LONG' if is_long else 'SHORT'}</b> · sweep + reclaim confirmat\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Preț: <b>${price:,.4f}</b>\n"
+        f"📊 Scor sweep: <b>{sig['score']}/100</b>\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ Nu e sfat financiar. Verifică manual."
+    )
+
+
+def scan_symbol_sweep(symbol):
+    """Rulează Liquidity Sweep pe un simbol și alertează la sweep confirmat nou."""
+    try:
+        kl15 = get_klines(symbol, "15m", 200)
+        kl4h = get_klines(symbol, "4h", 30)
+        sig = sweep_signal(kl15, kl4h, int(time.time() * 1000))
+        st = sweep_state.setdefault(symbol, {"prev_dir": 0, "last_alert_ts": 0})
+        if not sig or sig["dir"] == 0:
+            st["prev_dir"] = 0
+            return
+        price = kl15[-1]["c"]
+        log.info(f"{symbol:12s} SWEEP score={sig['score']}/100  dir={sig['dir']}")
+        now = time.time()
+        if sig["dir"] != st["prev_dir"] and now - st.get("last_alert_ts", 0) > 5 * 60:
+            st["prev_dir"] = sig["dir"]
+            st["last_alert_ts"] = now
+            if send_telegram(build_sweep_message(symbol, sig, price)):
+                log.info(f"  → Alertă SWEEP trimisă pentru {symbol}")
+    except Exception as e:
+        log.error(f"Eroare la sweep {symbol}: {e}")
+
+
+# ─────────────────────────────────────────────
+# ALERTE DE PREȚ (user, din UI → Netlify Blobs)
+# ─────────────────────────────────────────────
+def check_price_alerts():
+    """Citește alertele de preț ale userului din cloud, verifică prețul curent
+    și trimite Telegram la declanșare — 24/7, fără browser deschis.
+    Marchează alerta ca inactivă și scrie lista înapoi în cloud (anti-repeat)."""
+    if not ALERTS_URL or not ALERTS_KEY:
+        return
+    try:
+        r = requests.get(ALERTS_URL, headers={"x-ci-key": ALERTS_KEY}, timeout=10)
+        r.raise_for_status()
+        alerts = r.json()
+    except Exception as e:
+        log.warning(f"Nu am putut citi alertele de preț din cloud: {e}")
+        return
+    if not isinstance(alerts, list) or not alerts:
+        return
+
+    # Un singur fetch de preț per simbol, doar pentru alertele active.
+    syms = sorted({a["sym"] for a in alerts if a.get("active") and a.get("sym")})
+    prices = {}
+    for s in syms:
+        try:
+            prices[s] = get_price(s)
+        except Exception as e:
+            log.warning(f"Preț indisponibil pentru {s}: {e}")
+
+    changed = False
+    for a in alerts:
+        if not a.get("active"):
+            continue
+        p = prices.get(a.get("sym"))
+        if p is None:
+            continue
+        target = float(a["price"])
+        hit = p >= target if a.get("cond") == "above" else p <= target
+        if hit:
+            a["active"] = False
+            a["triggeredAt"] = int(time.time() * 1000)
+            a["triggeredPrice"] = p
+            changed = True
+            disp = a["sym"].replace("USDT", "/USDT")
+            verb = "a trecut PESTE" if a.get("cond") == "above" else "a coborât SUB"
+            send_telegram(
+                f"🔔 <b>ALERTĂ DE PREȚ</b>\n"
+                f"<b>{disp}</b> {verb} <b>{target:,.4f}</b>\n"
+                f"💰 Preț curent: <b>{p:,.4f}</b>\n"
+                f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+            )
+            log.info(f"  → Alertă de preț declanșată: {a['sym']} @ {p}")
+
+    if changed:
+        try:
+            requests.post(
+                ALERTS_URL,
+                headers={"x-ci-key": ALERTS_KEY, "Content-Type": "application/json"},
+                json=alerts, timeout=10,
+            )
+        except Exception as e:
+            log.error(f"Nu am putut actualiza alertele în cloud: {e}")
+
+
+def load_watchlist_cloud():
+    """Watchlist din cloud (Netlify Blobs) — listă de {sym, strat}.
+    Fallback la watchlist.txt (toate pe 'conf') dacă nu e configurat/gol."""
+    if WATCHLIST_URL and ALERTS_KEY:
+        try:
+            r = requests.get(WATCHLIST_URL, headers={"x-ci-key": ALERTS_KEY}, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list) and data:
+                return [
+                    {"sym": w["sym"].upper(), "strat": w.get("strat", "conf")}
+                    for w in data if w.get("sym")
+                ]
+        except Exception as e:
+            log.warning(f"Watchlist cloud indisponibil ({e}) — folosesc watchlist.txt")
+    return [{"sym": s, "strat": "conf"} for s in load_watchlist()]
+
+
 def scan_pass():
-    """O singură trecere: confluence pe watchlist + SFP pe SFP_SYMBOLS."""
-    watchlist = load_watchlist()
-    log.info(f"Scanez {len(watchlist)} simboluri: {', '.join(watchlist)}")
-    for sym in watchlist:
-        scan_symbol(sym)
+    """O singură trecere: alerte de preț + watchlist (conf/sweep per monedă) + SFP."""
+    # Alertele de preț ale userului (rapid, un fetch de preț per simbol).
+    check_price_alerts()
+    wl = load_watchlist_cloud()
+    log.info(f"Scanez {len(wl)} simboluri: {', '.join(w['sym'] for w in wl)}")
+    for w in wl:
+        sym, strat = w["sym"], w.get("strat", "conf")
+        if strat in ("conf", "both"):
+            scan_symbol(sym)  # Confluence Score
+        if strat in ("sweep", "both"):
+            scan_symbol_sweep(sym)  # Liquidity Sweep
         time.sleep(1)  # mic delay între simboluri, să nu lovim rate-limit Binance
-    # SFP (Playbook 1) — rulează doar în ferestrele Londra/NY open;
+    # SFP dedicat (Playbook 1) — rulează doar în ferestrele Londra/NY open;
     # în afara lor, scan_sfp iese imediat, fără apeluri API.
     for sym in SFP_SYMBOLS:
         sfp.scan_sfp(sym, send_telegram)
