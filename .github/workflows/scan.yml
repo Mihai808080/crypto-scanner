@@ -46,6 +46,9 @@ jobs:
           TEST_PING: ${{ inputs.test_ping }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          ALERTS_URL: ${{ secrets.ALERTS_URL }}
+          WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
+          ALERTS_KEY: ${{ secrets.ALERTS_KEY }}
           MIN_SCORE: "65"
           SFP_SYMBOLS: "DOGEUSDT,SOLUSDT"
         run: python scanner.py
