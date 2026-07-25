@@ -1,0 +1,23 @@
+name: probe-endpoints
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Test data endpoints
+        run: |
+          test() {
+            code=$(curl -s -o /tmp/body -w '%{http_code}' --max-time 15 "$2" || echo "ERR")
+            echo "== $1 -> $code :: $(head -c 120 /tmp/body)"
+          }
+          test "binance-fapi-klines"   "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=15m&limit=5"
+          test "binance-spot-api"      "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=5"
+          test "binance-vision"        "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=5"
+          test "bybit-linear"          "https://api.bybit.com/v5/market/kline?category=linear&symbol=BTCUSDT&interval=15&limit=5"
+          test "mexc-contract"         "https://contract.mexc.com/api/v1/contract/kline/BTC_USDT?interval=Min15&start=0"
+          test "mexc-spot"             "https://api.mexc.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=5"
+          test "okx"                   "https://www.okx.com/api/v5/market/candles?instId=BTC-USDT-SWAP&bar=15m&limit=5"
+          test "gate"                  "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=BTC_USDT&interval=15m&limit=5"
+          test "kucoin-fut"            "https://api-futures.kucoin.com/api/v1/kline/query?symbol=XBTUSDTM&granularity=15&from=$(( ($(date +%s)-7200) * 1000 ))"
