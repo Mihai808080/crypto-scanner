@@ -59,7 +59,8 @@ BINANCE_BASE = os.environ.get("BINANCE_BASE", "https://data-api.binance.vision/a
 # Fallback pentru monedele care nu există pe spot Binance (perp-only: HYPE,
 # ASTER, 1000BONK, MOCA, POPCAT etc.) — futures MEXC, accesibil din Actions.
 MEXC_BASE = "https://contract.mexc.com/api/v1/contract"
-_src = {}  # symbol -> "binance" | "mexc" (memorat ca să nu reîncerce degeaba)
+MEXC_SPOT_BASE = "https://api.mexc.com/api/v3"
+_src = {}  # symbol -> "binance" | "mexc_spot" | "mexc_fut" (rezolvat o singură dată)
 _MEXC_IV = {
     "1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30",
     "1h": "Min60", "4h": "Hour4", "8h": "Hour8", "1d": "Day1",
@@ -183,53 +184,89 @@ def _mexc_klines(symbol, interval, limit):
     return out[-limit:]
 
 
-def _use_mexc(symbol, err):
-    """Marchează simbolul ca 'de luat de pe MEXC' când Binance spot nu-l are."""
-    if _src.get(symbol) != "mexc":
-        log.info(f"{symbol}: nu e pe spot Binance ({err}) — trec pe MEXC")
-    _src[symbol] = "mexc"
+# Spot MEXC folosește "60m" în loc de "1h" (restul intervalelor coincid cu Binance).
+_MEXC_SPOT_IV = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+                 "1h": "60m", "4h": "4h", "1d": "1d"}
+
+
+def _mexc_spot_klines(symbol, interval, limit):
+    """Klines de pe spot MEXC (format compatibil Binance, dar fără taker-buy)."""
+    raw = _get(f"{MEXC_SPOT_BASE}/klines",
+               {"symbol": symbol.upper(), "interval": _MEXC_SPOT_IV.get(interval, interval),
+                "limit": limit}).json()
+    if not raw:
+        raise ValueError(f"MEXC spot fără lumânări pentru {symbol}")
+    return [
+        {
+            "t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+            "c": float(k[4]), "v": float(k[5]), "tb": float(k[5]) / 2,
+        }
+        for k in raw
+    ]
+
+
+def _resolve_src(symbol):
+    """Alege sursa pentru un simbol, o dată, și o memorează:
+    binance (mirror spot) → mexc spot → mexc futures.
+
+    ATENȚIE la coliziunile de ticker: contractul futures MEXC poate fi cu totul
+    alt activ decât tokenul cu același ticker (ex. EWT_USDT futures = 98.98 vs
+    EWT spot = 0.2775). De aceea spot-ul MEXC are prioritate față de futures,
+    iar futures se acceptă doar dacă spot-ul nu listează deloc simbolul.
+    """
+    if symbol in _src:
+        return _src[symbol]
+    try:
+        _get(f"{BINANCE_BASE}/klines", {"symbol": symbol, "interval": "15m", "limit": 1})
+        _src[symbol] = "binance"
+    except Exception as e:
+        try:
+            _get(f"{MEXC_SPOT_BASE}/klines", {"symbol": symbol.upper(), "interval": "15m", "limit": 1})
+            _src[symbol] = "mexc_spot"
+            log.info(f"{symbol}: nu e pe spot Binance ({e}) — folosesc spot MEXC")
+        except Exception as e2:
+            _src[symbol] = "mexc_fut"
+            log.info(f"{symbol}: nici pe spot MEXC ({e2}) — folosesc futures MEXC")
+    return _src[symbol]
 
 
 def get_klines(symbol, interval, limit):
-    if _src.get(symbol) != "mexc":
-        try:
-            r = _get(f"{BINANCE_BASE}/klines",
-                     {"symbol": symbol, "interval": interval, "limit": limit})
-            _src[symbol] = "binance"
-            # k[9] = taker buy base volume — permite delta de agresiune REALĂ, nu estimată
-            return [
-                {
-                    "t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-                    "c": float(k[4]), "v": float(k[5]), "tb": float(k[9]),
-                }
-                for k in r.json()
-            ]
-        except Exception as e:
-            _use_mexc(symbol, e)
+    src = _resolve_src(symbol)
+    if src == "binance":
+        r = _get(f"{BINANCE_BASE}/klines",
+                 {"symbol": symbol, "interval": interval, "limit": limit})
+        # k[9] = taker buy base volume — permite delta de agresiune REALĂ, nu estimată
+        return [
+            {
+                "t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+                "c": float(k[4]), "v": float(k[5]), "tb": float(k[9]),
+            }
+            for k in r.json()
+        ]
+    if src == "mexc_spot":
+        return _mexc_spot_klines(symbol, interval, limit)
     return _mexc_klines(symbol, interval, limit)
 
 
 def get_ticker(symbol):
-    if _src.get(symbol) != "mexc":
-        try:
-            d = _get(f"{BINANCE_BASE}/ticker/24hr", {"symbol": symbol}).json()
-            _src[symbol] = "binance"
-            return float(d["lastPrice"]), float(d["priceChangePercent"])
-        except Exception as e:
-            _use_mexc(symbol, e)
+    src = _resolve_src(symbol)
+    if src == "binance":
+        d = _get(f"{BINANCE_BASE}/ticker/24hr", {"symbol": symbol}).json()
+        return float(d["lastPrice"]), float(d["priceChangePercent"])
+    if src == "mexc_spot":
+        d = _get(f"{MEXC_SPOT_BASE}/ticker/24hr", {"symbol": symbol.upper()}).json()
+        return float(d["lastPrice"]), float(d.get("priceChangePercent", 0))
     d = _mexc_data("ticker", {"symbol": _mexc_sym(symbol)})
     return float(d["lastPrice"]), float(d.get("riseFallRate", 0)) * 100
 
 
 def get_price(symbol):
     """Doar ultimul preț — pentru alertele de preț ale userului."""
-    if _src.get(symbol) != "mexc":
-        try:
-            p = float(_get(f"{BINANCE_BASE}/ticker/price", {"symbol": symbol}).json()["price"])
-            _src[symbol] = "binance"
-            return p
-        except Exception as e:
-            _use_mexc(symbol, e)
+    src = _resolve_src(symbol)
+    if src == "binance":
+        return float(_get(f"{BINANCE_BASE}/ticker/price", {"symbol": symbol}).json()["price"])
+    if src == "mexc_spot":
+        return float(_get(f"{MEXC_SPOT_BASE}/ticker/price", {"symbol": symbol.upper()}).json()["price"])
     d = _mexc_data("ticker", {"symbol": _mexc_sym(symbol)})
     return float(d["lastPrice"])
 
