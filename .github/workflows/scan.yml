@@ -1,18 +1,25 @@
 name: crypto-scan
 
-# Rulează scannerul la fiecare 5 minute + buton manual pentru test.
-# NOTĂ: cron-ul GitHub poate întârzia 5-15 min sub încărcare — normal pt. free.
+# Job LUNG cu buclă internă: o rulare ține ~5h45m și scanează la fiecare 5 min.
+# Motivul: cron-ul GitHub pe */5 era executat în realitate o dată la 1-2 ore
+# (întârzieri normale pe free tier), deci alertele veneau rar sau deloc.
+# Cron-ul de aici doar pornește jobul; `concurrency` garantează că nu rulează
+# două în paralel, iar o rulare programată în timp ce alta e activă așteaptă la
+# coadă și pornește imediat ce prima iese → acoperire aproape continuă.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       test_ping:
         description: "Trimite un mesaj de test pe Telegram"
         type: boolean
         default: false
+      once:
+        description: "O singură trecere (debug), nu buclă"
+        type: boolean
+        default: false
 
-# Nu porni o rulare nouă dacă una e încă în curs (evită suprapuneri).
 concurrency:
   group: crypto-scan
   cancel-in-progress: false
@@ -20,7 +27,7 @@ concurrency:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 355   # 5h55m; scanner-ul iese singur la 5h45m (MAX_RUNTIME_SEC)
     steps:
       - uses: actions/checkout@v4
 
@@ -40,15 +47,17 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run one scan pass
+      - name: Run scanner
         env:
-          RUN_ONCE: "1"
+          RUN_ONCE: ${{ inputs.once && '1' || '' }}
           TEST_PING: ${{ inputs.test_ping }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           ALERTS_URL: ${{ secrets.ALERTS_URL }}
           WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
           ALERTS_KEY: ${{ secrets.ALERTS_KEY }}
-          MIN_SCORE: "65"
+          MIN_SCORE: "75"
+          SCAN_INTERVAL_SEC: "300"
+          MAX_RUNTIME_SEC: "20700"   # 5h45m
           SFP_SYMBOLS: "DOGEUSDT,SOLUSDT"
         run: python scanner.py

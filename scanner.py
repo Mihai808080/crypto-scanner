@@ -50,7 +50,23 @@ WATCHLIST_URL = os.environ.get("WATCHLIST_URL", "")
 # restaurat/salvat prin actions/cache; local e doar un fișier lângă scanner.
 STATE_FILE = os.environ.get("STATE_FILE", "scan_state.json")
 
-BINANCE_BASE = "https://fapi.binance.com/fapi/v1"
+# Sursa de date. ATENȚIE: fapi.binance.com ȘI api.binance.com răspund cu
+# 451 (Unavailable For Legal Reasons) de pe runnerele GitHub Actions — de aceea
+# scannerul din cloud nu trimitea nimic. data-api.binance.vision e mirror-ul
+# public de date Binance (spot) și e accesibil de acolo; are aceeași formă de
+# răspuns (inclusiv taker-buy volume la index 9, deci CVD-ul rămâne real).
+BINANCE_BASE = os.environ.get("BINANCE_BASE", "https://data-api.binance.vision/api/v3")
+# Fallback pentru monedele care nu există pe spot Binance (perp-only: HYPE,
+# ASTER, 1000BONK, MOCA, POPCAT etc.) — futures MEXC, accesibil din Actions.
+MEXC_BASE = "https://contract.mexc.com/api/v1/contract"
+_src = {}  # symbol -> "binance" | "mexc" (memorat ca să nu reîncerce degeaba)
+_MEXC_IV = {
+    "1m": "Min1", "5m": "Min5", "15m": "Min15", "30m": "Min30",
+    "1h": "Min60", "4h": "Hour4", "8h": "Hour8", "1d": "Day1",
+}
+_IV_SEC = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "8h": 28800, "1d": 86400}
+# Oprire curată înainte de limita de 6h a unui job GitHub Actions (0 = fără limită).
+MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "0"))
 
 # Anti-spam: ultima direcție/alertă trimisă per simbol
 state = {}  # { "BTCUSDT": {"prev_dir": 0, "last_alert_ts": 0} }
@@ -102,35 +118,120 @@ def load_watchlist():
 # ─────────────────────────────────────────────
 # BINANCE DATA
 # ─────────────────────────────────────────────
+def _get(url, params=None, timeout=15, tries=3):
+    """GET cu retry + backoff pe 429/418/5xx. Ridică ultima eroare dacă nu reușește."""
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code in (418, 429) or r.status_code >= 500:
+                wait = 3 * (2 ** i)
+                log.warning(f"HTTP {r.status_code} de la {url} — reîncerc în {wait}s")
+                last = requests.HTTPError(f"{r.status_code} de la {url}")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r
+        except requests.RequestException as e:
+            last = e
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            # Simbol inexistent / blocat geografic — n-are rost să reîncerc.
+            if status in (400, 404, 451):
+                raise
+            time.sleep(2 ** i)
+    raise last
+
+
+def _mexc_sym(symbol):
+    s = symbol.upper()
+    return f"{s[:-4]}_USDT" if s.endswith("USDT") else s
+
+
+def _mexc_data(path, params=None, tries=3):
+    """GET pe MEXC + validare payload ({'success':true,'data':...}).
+    MEXC returnează ocazional success=false / data goală sub rafală — reîncearcă."""
+    last = None
+    for i in range(tries):
+        j = _get(f"{MEXC_BASE}/{path}", params).json() or {}
+        data = j.get("data")
+        if j.get("success") and data:
+            return data
+        last = j.get("message") or j.get("code")
+        time.sleep(1 + i)
+    raise ValueError(f"MEXC fără date pentru {path} ({last})")
+
+
+def _mexc_klines(symbol, interval, limit):
+    iv = _MEXC_IV.get(interval)
+    sec = _IV_SEC.get(interval, 900)
+    if not iv:
+        raise ValueError(f"interval nesuportat pe MEXC: {interval}")
+    start = int(time.time()) - (limit + 2) * sec
+    d = _mexc_data(f"kline/{_mexc_sym(symbol)}", {"interval": iv, "start": start})
+    ts = d.get("time") or []
+    out = []
+    for i in range(len(ts)):
+        v = float(d["vol"][i])
+        out.append({
+            "t": int(ts[i]) * 1000, "o": float(d["open"][i]), "h": float(d["high"][i]),
+            "l": float(d["low"][i]), "c": float(d["close"][i]), "v": v,
+            # MEXC nu expune taker-buy volume → delta neutră (CVD nu inventează direcție).
+            "tb": v / 2,
+        })
+    if not out:
+        raise ValueError(f"MEXC n-a returnat lumânări pentru {symbol} {interval}")
+    return out[-limit:]
+
+
+def _use_mexc(symbol, err):
+    """Marchează simbolul ca 'de luat de pe MEXC' când Binance spot nu-l are."""
+    if _src.get(symbol) != "mexc":
+        log.info(f"{symbol}: nu e pe spot Binance ({err}) — trec pe MEXC")
+    _src[symbol] = "mexc"
+
+
 def get_klines(symbol, interval, limit):
-    url = f"{BINANCE_BASE}/klines"
-    r = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
-    r.raise_for_status()
-    raw = r.json()
-    # k[9] = taker buy base volume — permite delta de agresiune REALĂ, nu estimată
-    return [
-        {
-            "t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-            "c": float(k[4]), "v": float(k[5]), "tb": float(k[9]),
-        }
-        for k in raw
-    ]
+    if _src.get(symbol) != "mexc":
+        try:
+            r = _get(f"{BINANCE_BASE}/klines",
+                     {"symbol": symbol, "interval": interval, "limit": limit})
+            _src[symbol] = "binance"
+            # k[9] = taker buy base volume — permite delta de agresiune REALĂ, nu estimată
+            return [
+                {
+                    "t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+                    "c": float(k[4]), "v": float(k[5]), "tb": float(k[9]),
+                }
+                for k in r.json()
+            ]
+        except Exception as e:
+            _use_mexc(symbol, e)
+    return _mexc_klines(symbol, interval, limit)
 
 
 def get_ticker(symbol):
-    url = f"{BINANCE_BASE}/ticker/24hr"
-    r = requests.get(url, params={"symbol": symbol}, timeout=10)
-    r.raise_for_status()
-    d = r.json()
-    return float(d["lastPrice"]), float(d["priceChangePercent"])
+    if _src.get(symbol) != "mexc":
+        try:
+            d = _get(f"{BINANCE_BASE}/ticker/24hr", {"symbol": symbol}).json()
+            _src[symbol] = "binance"
+            return float(d["lastPrice"]), float(d["priceChangePercent"])
+        except Exception as e:
+            _use_mexc(symbol, e)
+    d = _mexc_data("ticker", {"symbol": _mexc_sym(symbol)})
+    return float(d["lastPrice"]), float(d.get("riseFallRate", 0)) * 100
 
 
 def get_price(symbol):
     """Doar ultimul preț — pentru alertele de preț ale userului."""
-    url = f"{BINANCE_BASE}/ticker/price"
-    r = requests.get(url, params={"symbol": symbol}, timeout=10)
-    r.raise_for_status()
-    return float(r.json()["price"])
+    if _src.get(symbol) != "mexc":
+        try:
+            p = float(_get(f"{BINANCE_BASE}/ticker/price", {"symbol": symbol}).json()["price"])
+            _src[symbol] = "binance"
+            return p
+        except Exception as e:
+            _use_mexc(symbol, e)
+    d = _mexc_data("ticker", {"symbol": _mexc_sym(symbol)})
+    return float(d["lastPrice"])
 
 
 # ─────────────────────────────────────────────
@@ -850,9 +951,17 @@ def main():
         log.info("Trecere unică completă (RUN_ONCE).")
         return
 
-    # Server always-on / local: buclă continuă (starea trăiește în memorie).
+    # Buclă continuă: server always-on, local SAU job lung pe GitHub Actions.
+    # Cu MAX_RUNTIME_SEC setat, iese curat înainte de limita de 6h a jobului;
+    # starea anti-spam e salvată după fiecare trecere (o preia cache-ul Actions).
+    started = time.time()
+    load_state()
     while True:
         scan_pass()
+        save_state()
+        if MAX_RUNTIME_SEC and time.time() - started + SCAN_INTERVAL_SEC > MAX_RUNTIME_SEC:
+            log.info(f"Am atins MAX_RUNTIME_SEC ({MAX_RUNTIME_SEC}s) — ies curat.")
+            return
         log.info(f"Scan complet. Următorul scan în {SCAN_INTERVAL_SEC}s.\n")
         time.sleep(SCAN_INTERVAL_SEC)
 
