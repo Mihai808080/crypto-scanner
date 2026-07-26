@@ -267,3 +267,40 @@ def get_open_interest(symbol):
     except Exception as e:
         log.warning(f"OI indisponibil pentru {symbol}: {e}")
         return None
+
+
+# ─────────────────────────────────────────────
+# POZIȚIONARE RETAIL (OKX) — singura sursă care răspunde din Actions
+# ─────────────────────────────────────────────
+# Binance dă 451, Bybit 403 (CloudFront blochează țara runnerului). OKX merge,
+# dar ține doar ~2 zile de istoric la 5m — prea puțin ca să backtestezi ceva.
+# De aceea metrica e LIVE-ONLY: se afișează și se colectează, NU intră în scor.
+OKX_BASE = "https://www.okx.com/api/v5"
+
+
+def _okx_ccy(symbol):
+    s = symbol.upper()
+    return s[:-4] if s.endswith("USDT") else s
+
+
+def get_long_short_ratio(symbol, period="5m"):
+    """Raportul conturilor long/short pe OKX.
+
+    Întoarce {'ratio', 'pct', 'n'} unde pct e rangul procentual al valorii
+    curente în istoricul disponibil — nivelul absolut nu spune nimic singur
+    (DOGE stă cronic pe 2.9, adică retailul e permanent long acolo), contează
+    cât de extrem e față de propriul obicei recent. None dacă sursa tace.
+    """
+    try:
+        r = _get(f"{OKX_BASE}/rubik/stat/contracts/long-short-account-ratio",
+                 {"ccy": _okx_ccy(symbol), "period": period})
+        rows = (r.json() or {}).get("data") or []
+        vals = [float(x[1]) for x in rows if len(x) > 1]
+        if len(vals) < 20:
+            return None
+        cur = vals[0]  # OKX întoarce cel mai recent primul
+        below = sum(1 for v in vals if v < cur)
+        return {"ratio": cur, "pct": 100.0 * below / len(vals), "n": len(vals)}
+    except Exception as e:
+        log.warning(f"Long/short ratio indisponibil pentru {symbol}: {e}")
+        return None

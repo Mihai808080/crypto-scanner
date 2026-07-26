@@ -15,6 +15,8 @@ import logging
 from datetime import datetime, timezone
 import requests
 
+import consensus  # Consensus Radar — informativ, nu intră în scor
+import datasrc
 import sfp  # Playbook 1: Sweep & Reclaim — alerte SETUP (execuție discreționară)
 # Stratul de date e comun cu sfp.py (vezi datasrc.py pentru motivul 451).
 from datasrc import get_klines, get_price, get_ticker
@@ -73,6 +75,7 @@ def load_state():
         state.update(data.get("confluence", {}))
         sweep_state.update(data.get("sweep", {}))
         sfp._alerted.update(data.get("sfp", {}))
+        sfp._crowding.extend(data.get("crowding", []))
         log.info(f"Stare încărcată din {STATE_FILE}")
     except Exception as e:
         log.warning(f"Nu am putut încărca starea ({e}) — pornesc curat")
@@ -82,7 +85,8 @@ def save_state():
     """Salvează starea anti-spam în STATE_FILE."""
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"confluence": state, "sweep": sweep_state, "sfp": sfp._alerted}, f)
+            json.dump({"confluence": state, "sweep": sweep_state,
+                       "sfp": sfp._alerted, "crowding": sfp._crowding}, f)
     except Exception as e:
         log.error(f"Nu am putut salva starea: {e}")
 
@@ -772,6 +776,29 @@ def load_watchlist_cloud():
     return [{"sym": s, "strat": "conf"} for s in load_watchlist()]
 
 
+def collect_crowding():
+    """Eșantionează aglomerarea pentru simbolurile SFP, o dată pe trecere.
+
+    Datele de poziționare reală (long/short ratio OKX) există live, dar sursa
+    păstrează doar ~2 zile de istoric la 5m — prea puțin ca să backtestezi
+    ceva. Colectăm noi, ca peste câteva săptămâni să existe un istoric propriu
+    pe care întrebarea „merită în scor?" să poată primi un răspuns măsurat.
+
+    Cost: 2 apeluri per simbol per trecere. Orice eroare e înghițită — o
+    colectare de date nu are voie să afecteze alertele.
+    """
+    if os.environ.get("COLLECT_CROWDING", "1") != "1":
+        return
+    for sym in SFP_SYMBOLS:
+        try:
+            kl = get_klines(sym, "5m", 300)
+            cons = consensus.consensus(kl)
+            ls = datasrc.get_long_short_ratio(sym)
+            sfp.record_crowding(sym, kl[-1]["t"], cons, ls)
+        except Exception as e:
+            log.warning(f"Eșantion de aglomerare eșuat pentru {sym}: {e}")
+
+
 def scan_pass():
     """O singură trecere: alerte de preț + watchlist (conf/sweep per monedă) + SFP."""
     # Alertele de preț ale userului (rapid, un fetch de preț per simbol).
@@ -790,6 +817,7 @@ def scan_pass():
     for sym in SFP_SYMBOLS:
         sfp.scan_sfp(sym, send_telegram)
         time.sleep(1)
+    collect_crowding()
 
 
 def main():

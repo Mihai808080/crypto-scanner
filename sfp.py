@@ -26,6 +26,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import consensus as consensus_mod
 import datasrc
 
 log = logging.getLogger("sfp")
@@ -48,6 +49,34 @@ ROUND_STEP = {"BTCUSDT": 1000.0, "ETHUSDT": 100.0, "SOLUSDT": 5.0, "DOGEUSDT": 0
 
 # Anti-spam: (symbol) -> timestamp-ul barei M5 pentru care s-a alertat deja
 _alerted = {}
+
+# Eșantioane de aglomerare, persistate între rulări prin starea scannerului.
+# Rostul lor: raportul long/short de pe OKX are doar ~2 zile de istoric public,
+# deci azi NU se poate backtesta. Colectându-l noi, peste câteva săptămâni
+# avem propriul istoric și abia atunci se poate pune întrebarea dacă merită
+# să intre în scor. Până atunci rămâne informativ.
+_crowding = []
+CROWDING_MAX = 4000  # ~2 săptămâni la 2 simboluri × 5 min; ține cache-ul mic
+
+
+def record_crowding(symbol, ts, cons, ls, funding=None, direction=0):
+    """Adaugă un eșantion. Nu ridică niciodată — colectarea de date nu are voie
+    să strice o scanare."""
+    try:
+        row = {"t": int(ts), "sym": symbol, "dir": direction}
+        if cons:
+            row["cons_pct"] = round(cons["pct"], 1)
+            row["cons_net"] = cons["net"]
+        if ls:
+            row["ls"] = round(ls["ratio"], 4)
+            row["ls_pct"] = round(ls["pct"], 1)
+        if funding:
+            row["fund"] = funding[-1]["r"]
+        _crowding.append(row)
+        if len(_crowding) > CROWDING_MAX:
+            del _crowding[:len(_crowding) - CROWDING_MAX]
+    except Exception as e:
+        log.warning(f"Nu am putut înregistra eșantionul de aglomerare: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -214,7 +243,25 @@ def funding_grade(funding, direction):
 # ─────────────────────────────────────────────
 # MESAJ + SCAN
 # ─────────────────────────────────────────────
-def build_sfp_message(symbol, sig, bars, i, funding):
+def crowding_line(cons, ls):
+    """Linia „Consensus Radar" din alertă — INFORMATIVĂ.
+
+    Nu intră în niciun scor și nu filtrează nimic. Consensul de indicatori a
+    fost backtestat (vezi tools/backtest_consensus.py); raportul long/short de
+    pe OKX NU poate fi backtestat deocamdată — sursa ține doar ~2 zile de
+    istoric la 5m — deci se afișează și se colectează, atât.
+    """
+    parts = []
+    if cons:
+        parts.append(consensus_mod.label(cons))
+    if ls:
+        parts.append(f"L/S OKX {ls['ratio']:.2f} (p{ls['pct']:.0f})")
+    if not parts:
+        return ""
+    return f"🐑 Turmă: {' · '.join(parts)}\n"
+
+
+def build_sfp_message(symbol, sig, bars, i, funding, cons=None, ls=None):
     d = sig["dir"]
     level = sig["level"]
     limit = level["p"]
@@ -245,6 +292,7 @@ def build_sfp_message(symbol, sig, bars, i, funding):
         f"🚀 TP2 (pool):    ${tp2:,.4f}\n"
         f"🏷️ Grad: <b>{grade}</b> — {risk_note} (funding {frate * 100:+.4f}%)\n"
         f"⏱️ Time-stop: 3×M5 fără +0.5R → ieși\n"
+        f"{crowding_line(cons, ls)}"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"👁️ CVD div. ✓ · Confirmă regimul pe chart înainte de execuție.\n"
@@ -283,7 +331,11 @@ def scan_sfp(symbol, send_fn):
             log.info(f"{symbol}: SFP detectat dar stop < {MIN_STOP_PCT*100:.2f}% — skip (fees)")
             return False
         funding = get_funding(symbol)
-        msg = build_sfp_message(symbol, sig, bars, i, funding)
+        # Măsurate pe barele DE PÂNĂ LA semnal inclusiv (fără lookahead).
+        cons = consensus_mod.consensus(bars[:i + 1][-260:])
+        ls = datasrc.get_long_short_ratio(symbol)
+        record_crowding(symbol, bar["t"], cons, ls, funding, sig["dir"])
+        msg = build_sfp_message(symbol, sig, bars, i, funding, cons, ls)
         _alerted[symbol] = bar["t"]
         if send_fn(msg):
             log.info(f"  → 🎯 Alertă SFP trimisă: {symbol} {'LONG' if sig['dir'] == 1 else 'SHORT'} @ {limit}")
