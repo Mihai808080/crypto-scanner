@@ -11,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       which:
-        description: "endpoints = ce răspunde · history = cât de înapoi · backtest"
+        description: "endpoints · history · backtest · selftest"
         type: choice
-        options: [endpoints, history, backtest]
+        options: [endpoints, history, backtest, selftest]
         default: endpoints
       symbols:
         description: "backtest: simboluri separate prin virgulă"
@@ -34,8 +34,13 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Probe
-        if: inputs.which != 'backtest'
+        if: inputs.which == 'endpoints' || inputs.which == 'history'
         run: python tools/probe_${{ inputs.which }}.py
+
+      # Fără secrete în env: self-testul verifică explicit că nu pleacă alerte.
+      - name: Self-test
+        if: inputs.which == 'selftest'
+        run: python tools/selftest.py
 
       - name: Backtest
         if: inputs.which == 'backtest'
