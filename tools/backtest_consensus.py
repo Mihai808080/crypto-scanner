@@ -69,17 +69,8 @@ def simulate(bars, sig_i, sig, round_step):
     if risk / limit < sfp.MIN_STOP_PCT:
         return None  # aceeași regulă ca în producție: stop prea mic vs. fees
 
-    # Fereastră de 900 de bare, exact cât vede producția când calculează
-    # pool-ul opus. Pe tot vectorul ar da aceleași niveluri, dar build_levels
-    # copiază bars[:i] la fiecare apel — pe 100k+ bare devine dominant.
-    lo = max(0, sig_i - SLICE + 1)
-    tp2 = sfp.opposite_pool(bars[lo:sig_i + 1], sig_i - lo, d, limit, round_step)
-    min_tp2 = limit + 1.5 * risk if d == 1 else limit - 1.5 * risk
-    if tp2 is None or (tp2 < min_tp2 if d == 1 else tp2 > min_tp2):
-        tp2 = limit + 2 * risk if d == 1 else limit - 2 * risk
-    tp1 = limit + risk if d == 1 else limit - risk
-
-    # 1) prinderea limitului
+    # 1) prinderea limitului — verificată PRIMA, fiind ieftină. Majoritatea
+    # semnalelor mor aici, iar calculul pool-ului opus e scump.
     fill = None
     for j in range(sig_i + 1, min(sig_i + 1 + ENTRY_VALID, len(bars))):
         b = bars[j]
@@ -89,7 +80,17 @@ def simulate(bars, sig_i, sig, round_step):
     if fill is None:
         return None
 
-    # 2) derularea poziției
+    # 2) ținte. Fereastră de 900 de bare, exact cât vede producția când
+    # calculează pool-ul opus: pe tot vectorul ar da aceleași niveluri, dar
+    # build_levels copiază bars[:i] la fiecare apel și pe 100k+ bare domină.
+    lo = max(0, sig_i - SLICE + 1)
+    tp2 = sfp.opposite_pool(bars[lo:sig_i + 1], sig_i - lo, d, limit, round_step)
+    min_tp2 = limit + 1.5 * risk if d == 1 else limit - 1.5 * risk
+    if tp2 is None or (tp2 < min_tp2 if d == 1 else tp2 > min_tp2):
+        tp2 = limit + 2 * risk if d == 1 else limit - 2 * risk
+    tp1 = limit + risk if d == 1 else limit - risk
+
+    # 3) derularea poziției
     half_done = False
     sl = stop
     r_acc = 0.0
