@@ -1,24 +1,51 @@
 name: probe-endpoints
 
-# Temporar, manual. Măsoară din runner ce burse răspund — nu se poate deduce
-# de pe alt IP (Binance dă 451 doar de aici). Se șterge după ce alegem sursa.
+# Manual, niciodată pe cron. Rulează unelte care au nevoie de rețeaua
+# runnerului: de pe alt IP nu se poate reproduce nimic (Binance dă 451 doar
+# de aici, Bybit 403). Nu atinge Telegram-ul și nu scrie starea scannerului.
+#
+# Backtestul stă tot aici, nu într-un workflow separat, pentru că
+# workflow_dispatch merge doar pe workflow-uri deja înregistrate pe branch-ul
+# default — unul nou, creat pe un feature branch, nu poate fi lansat.
 on:
   workflow_dispatch:
     inputs:
       which:
-        description: "endpoints = ce răspunde · history = cât de înapoi"
+        description: "endpoints = ce răspunde · history = cât de înapoi · backtest"
         type: choice
-        options: [endpoints, history]
+        options: [endpoints, history, backtest]
         default: endpoints
+      symbols:
+        description: "backtest: simboluri separate prin virgulă"
+        default: "DOGEUSDT,SOLUSDT"
+      months:
+        description: "backtest: câte luni înapoi"
+        default: "12"
 
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python tools/probe_${{ inputs.which == 'history' && 'history' || 'endpoints' }}.py
+
+      - name: Probe
+        if: inputs.which != 'backtest'
+        run: python tools/probe_${{ inputs.which }}.py
+
+      - name: Backtest
+        if: inputs.which == 'backtest'
+        env:
+          BT_SYMBOLS: ${{ inputs.symbols }}
+          BT_MONTHS: ${{ inputs.months }}
+        run: python tools/backtest_consensus.py | tee backtest-report.txt
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.which == 'backtest'
+        with:
+          name: backtest-report
+          path: backtest-report.txt
