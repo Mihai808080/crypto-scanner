@@ -69,7 +69,11 @@ def simulate(bars, sig_i, sig, round_step):
     if risk / limit < sfp.MIN_STOP_PCT:
         return None  # aceeași regulă ca în producție: stop prea mic vs. fees
 
-    tp2 = sfp.opposite_pool(bars, sig_i, d, limit, round_step)
+    # Fereastră de 900 de bare, exact cât vede producția când calculează
+    # pool-ul opus. Pe tot vectorul ar da aceleași niveluri, dar build_levels
+    # copiază bars[:i] la fiecare apel — pe 100k+ bare devine dominant.
+    lo = max(0, sig_i - SLICE + 1)
+    tp2 = sfp.opposite_pool(bars[lo:sig_i + 1], sig_i - lo, d, limit, round_step)
     min_tp2 = limit + 1.5 * risk if d == 1 else limit - 1.5 * risk
     if tp2 is None or (tp2 < min_tp2 if d == 1 else tp2 > min_tp2):
         tp2 = limit + 2 * risk if d == 1 else limit - 2 * risk
