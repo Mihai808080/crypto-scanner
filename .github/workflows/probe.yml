@@ -4,6 +4,12 @@ name: probe-endpoints
 # de pe alt IP (Binance dă 451 doar de aici). Se șterge după ce alegem sursa.
 on:
   workflow_dispatch:
+    inputs:
+      which:
+        description: "endpoints = ce răspunde · history = cât de înapoi"
+        type: choice
+        options: [endpoints, history]
+        default: endpoints
 
 jobs:
   probe:
@@ -15,4 +21,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python tools/probe.py
+      - run: python tools/probe_${{ inputs.which == 'history' && 'history' || 'endpoints' }}.py
