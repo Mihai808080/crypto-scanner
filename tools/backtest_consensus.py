@@ -58,8 +58,16 @@ def log(msg):
 # ─────────────────────────────────────────────
 # SIMULAREA UNUI TRADE
 # ─────────────────────────────────────────────
-def simulate(bars, sig_i, sig, round_step):
-    """Întoarce R-ul net al tradeului, sau None dacă limitul n-a fost prins."""
+def simulate(bars, sig_i, sig, round_step, be_mode="be", pessimistic=True):
+    """Întoarce R-ul net al tradeului, sau None dacă limitul n-a fost prins.
+
+    be_mode — ce se întâmplă cu restul poziției după TP1:
+      "be"     SL mutat exact la intrare (regula din alerta actuală)
+      "buffer" SL la intrare ∓0.1R (BE cu marjă, ca să nu te scoată zgomotul)
+      "none"   SL rămâne cel structural, lași runner-ul să respire
+      "single" fără runner: tot afară la TP1
+    pessimistic — dacă o bară atinge și SL și TP, presupunem SL-ul primul.
+    """
     d = sig["dir"]
     limit = sig["level"]["p"]
     stop = sig["wick"] * (1 - sfp.BUFFER) if d == 1 else sig["wick"] * (1 + sfp.BUFFER)
@@ -102,19 +110,27 @@ def simulate(bars, sig_i, sig, round_step):
         hit_tp1 = (b["h"] >= tp1) if d == 1 else (b["l"] <= tp1)
         hit_tp2 = (b["h"] >= tp2) if d == 1 else (b["l"] <= tp2)
 
-        # Conservator: SL-ul are prioritate în aceeași bară.
-        if hit_sl:
+        # Ordinea intrabară nu se poate ști din M5. Pesimist = SL primul.
+        if hit_sl and not (hit_tp1 and not pessimistic and not half_done):
             frac = 0.5 if half_done else 1.0
-            r_sl = 0.0 if half_done else -1.0  # după TP1, SL-ul e la BE
+            # Cât pierde restul poziției depinde de unde a ajuns stopul.
+            r_sl = ((sl - limit) if d == 1 else (limit - sl)) / risk
             r_acc += frac * r_sl
             r_acc -= frac * (FEE_TAKER * limit / risk)
             return r_acc - (FEE_MAKER * limit / risk)
 
         if not half_done and hit_tp1:
-            r_acc += 0.5 * 1.0
-            r_acc -= 0.5 * (FEE_TAKER * limit / risk)
+            take = 1.0 if be_mode == "single" else 0.5
+            r_acc += take * 1.0
+            r_acc -= take * (FEE_TAKER * limit / risk)
+            if be_mode == "single":
+                return r_acc - (FEE_MAKER * limit / risk)
             half_done = True
-            sl = limit  # breakeven
+            if be_mode == "be":
+                sl = limit
+            elif be_mode == "buffer":
+                sl = limit - 0.1 * risk if d == 1 else limit + 0.1 * risk
+            # "none" → stopul structural rămâne neatins
             bars_in = 0
 
         if half_done and hit_tp2:
@@ -244,6 +260,7 @@ def run_symbol(symbol):
         trades.append({
             "t": b["t"], "dir": sig["dir"], "r": r, "cons": cons,
             "kind": sig["level"]["kind"], "grade": grade,
+            "i": i, "sig": sig,
         })
 
     log(f"  {scanned} bare în fereastră · {len(trades)} tradeuri simulate\n")
@@ -255,6 +272,20 @@ def run_symbol(symbol):
     show("toate", [t["r"] for t in trades])
     show("LONG", [t["r"] for t in trades if t["dir"] == 1])
     show("SHORT", [t["r"] for t in trades if t["dir"] == -1])
+
+    # Aceleași semnale, reguli de ieșire diferite. Dacă baseline-ul e negativ
+    # doar cu regula actuală, problema e în management, nu în detector.
+    log("\n  ── SENSIBILITATE la regula de ieșire (același set de semnale) ──")
+    for mode, desc in (("be", "SL la BE după TP1 (regula actuală)"),
+                       ("buffer", "BE cu marjă 0.1R"),
+                       ("none", "fără BE, stop structural"),
+                       ("single", "tot afară la TP1 (1R)")):
+        rs = [r for r in (simulate(bars, t["i"], t["sig"], step, be_mode=mode)
+                          for t in trades) if r is not None]
+        show(desc, rs)
+    rs_opt = [r for r in (simulate(bars, t["i"], t["sig"], step, be_mode="none",
+                                   pessimistic=False) for t in trades) if r is not None]
+    show("fără BE + ordine intrabară optimistă", rs_opt)
 
     log("\n  ── FILTRU CONSENSUS (ideea luată de la trader) ──")
     with_cons = [t for t in trades if t["cons"]]
