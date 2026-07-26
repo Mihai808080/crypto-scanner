@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+scan_state.json
+backtest-report.txt
