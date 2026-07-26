@@ -1,0 +1,34 @@
+name: backtest
+
+# Manual. Rulează pe Actions pentru că doar de acolo se ajunge la sursele de
+# date (local/laptop e blocat geografic pe Binance). Nu atinge Telegram-ul și
+# nu scrie nimic în starea scannerului.
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Simboluri, separate prin virgulă"
+        default: "DOGEUSDT,SOLUSDT"
+      months:
+        description: "Câte luni înapoi"
+        default: "12"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run backtest
+        env:
+          BT_SYMBOLS: ${{ inputs.symbols }}
+          BT_MONTHS: ${{ inputs.months }}
+        run: python tools/backtest_consensus.py | tee backtest-report.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backtest-report
+          path: backtest-report.txt

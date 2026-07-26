@@ -13,6 +13,7 @@ Doar mirror-ul Binance dă taker-buy volume, deci doar acolo CVD-ul e real.
 """
 
 import logging
+import os
 import time
 
 import requests
@@ -23,7 +24,7 @@ log = logging.getLogger("datasrc")
 # Reasons) de pe runnerele GitHub Actions. data-api.binance.vision e mirror-ul
 # public de date spot, accesibil de acolo, cu aceeași formă de răspuns —
 # inclusiv taker-buy volume la index 9, deci CVD-ul rămâne real.
-BINANCE_BASE = "https://data-api.binance.vision/api/v3"
+BINANCE_BASE = os.environ.get("BINANCE_BASE", "https://data-api.binance.vision/api/v3")
 # Fallback pentru monedele care nu există pe spot Binance (perp-only: HYPE,
 # ASTER, 1000BONK, MOCA, POPCAT etc.).
 MEXC_BASE = "https://contract.mexc.com/api/v1/contract"

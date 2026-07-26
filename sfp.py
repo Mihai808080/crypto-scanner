@@ -13,18 +13,22 @@ TP2 la pool-ul opus. Execuția e discreționară — scannerul doar semnalează.
 
 Rezultatele complete ale backtestului: vezi memoria sesiunii Claude
 (sfp-playbook-research) sau scratchpad pb1/.
+
+SURSA DE DATE (iul. 2026): modulul citea direct fapi.binance.com, care
+răspunde 451 de pe runnerele GitHub — deci în cloud fiecare scanare pica cu
+"Eroare SFP ...: 451" și nicio alertă n-a plecat vreodată de acolo. Acum
+folosește datasrc, adică mirror-ul spot Binance. Diferența spot vs. perp e
+mică dar reală (wick-urile nu coincid perfect), de aceea edge-ul a fost
+re-măsurat pe date spot — vezi tools/backtest_consensus.py.
 """
 
-import os
-import time
 import logging
+import time
 from datetime import datetime, timezone
 
-import requests
+import datasrc
 
 log = logging.getLogger("sfp")
-
-BINANCE_BASE = "https://fapi.binance.com/fapi/v1"
 
 # ── Parametri (identici cu backtestul validat — NU-i modifica fără re-test) ──
 BUFFER = 0.0005          # stop = extrema wick-ului ± 0.05%
@@ -51,27 +55,13 @@ _alerted = {}
 # ─────────────────────────────────────────────
 def get_klines_5m(symbol, limit=900):
     """~3 zile de M5 — suficient pt. PDH/PDL (ziua UTC anterioară completă)."""
-    r = requests.get(
-        f"{BINANCE_BASE}/klines",
-        params={"symbol": symbol, "interval": "5m", "limit": limit},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return [
-        {"t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-         "c": float(k[4]), "v": float(k[5]), "tb": float(k[9])}
-        for k in r.json()
-    ]
+    return datasrc.get_klines(symbol, "5m", limit)
 
 
 def get_funding(symbol, limit=100):
-    r = requests.get(
-        f"{BINANCE_BASE}/fundingRate",
-        params={"symbol": symbol, "limit": limit},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return [{"t": int(f["fundingTime"]), "r": float(f["fundingRate"])} for f in r.json()]
+    """Istoric de funding (MEXC — Binance e 451 din Actions). Listă goală dacă
+    sursa nu răspunde: funding_grade degradează la B, nu blochează semnalul."""
+    return datasrc.get_funding(symbol, limit)
 
 
 # ─────────────────────────────────────────────
@@ -268,6 +258,13 @@ def scan_sfp(symbol, send_fn):
     if not in_window(now_ms):
         return False  # în afara ferestrelor validate — zero apeluri API
     try:
+        # Fără taker-buy volume, delta e 0 pe fiecare bară → CVD-ul e o linie
+        # plată, iar testul de divergență din detect_sfp trece ÎNTOTDEAUNA.
+        # Adică filtrul s-ar dezactiva în tăcere și am alerta pe sweep-uri
+        # neconfirmate. Mai bine sărim simbolul decât să slăbim setup-ul.
+        if not datasrc.has_real_cvd(symbol):
+            log.info(f"{symbol}: sursă fără taker-buy volume — SFP sărit (CVD indisponibil)")
+            return False
         bars = get_klines_5m(symbol)
         if len(bars) < EQ_LOOKBACK + 10:
             return False
