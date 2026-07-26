@@ -105,9 +105,49 @@ Diferențe cunoscute între cele două măsurători:
    observă. Structura se poate autoanula, independent de calitatea detecției.
 3. **Perioadă diferită**, deci posibilă degradare a edge-ului.
 
-Analiza de sensibilitate (același set de semnale, reguli de ieșire diferite)
-e în raportul rulării — vezi artefactul `backtest-report` al ultimei rulări
-`backtest`.
+### Analiza de sensibilitate — și de ce e concluzia cea mai importantă
 
-**Ce NU s-a schimbat pe baza asta:** niciun parametru al SFP-ului. Constatarea
-e raportată, nu acționată — decizia e a proprietarului strategiei.
+Același set de semnale, patru reguli de ieșire plus o variantă cu ordinea
+intrabară inversată.
+
+DOGEUSDT (n=202):
+
+| Regulă de ieșire | expectancy | WR | PF |
+|---|---|---|---|
+| SL la BE după TP1 (regula actuală) | −0.167R ±0.074 | 56.4% | 0.66 |
+| BE cu marjă 0.1R | −0.142R ±0.076 | 54.5% | 0.71 |
+| fără BE, stop structural | −0.093R ±0.086 | 35.6% | 0.83 |
+| tot afară la TP1 (1R) | −0.127R ±0.066 | 56.4% | 0.74 |
+| fără BE + **ordine intrabară optimistă** | **+0.051R ±0.083** | 38.1% | 1.11 |
+
+SOLUSDT (n=187): −0.277R / −0.281R / −0.226R / −0.301R / −0.044R în aceeași
+ordine.
+
+Trei lucruri de reținut:
+
+1. **Regula de BE costă, dar nu explică rezultatul.** Pe DOGE, scoaterea ei
+   aduce +0.074R — real, dar insuficient. Strategia rămâne negativă sub orice
+   regulă de management realistă, pe ambele simboluri.
+
+2. **Singura variantă pozitivă e cea cu ipoteza optimistă**, și e la mai
+   puțin de o eroare standard de zero (+0.051R ±0.083), adică
+   nedistinctibilă de zero.
+
+3. **Diferența dintre pesimist și optimist e 0.144R pe DOGE — mai mare decât
+   orice alt efect măsurat aici.** Asta înseamnă că la multe tradeuri aceeași
+   bară M5 atinge și stopul și ținta, iar rezultatul depinde de ordinea
+   mișcărilor în interiorul barei — informație pe care lumânările M5 pur și
+   simplu nu o conțin.
+
+**Concluzia metodologică:** la distanțele de stop folosite de acest playbook
+(0.15%–1%), un backtest pe M5 e sub-determinat. Nu poate distinge un edge de
++0.05R de unul de −0.09R, pentru că răspunsul stă sub rezoluția datelor. Este
+foarte posibil ca și cifra documentată (+0.29R) să provină dintr-o ipoteză
+optimistă de ordonare, nu dintr-un edge real.
+
+**Ce ar rezolva întrebarea:** re-rularea aceleiași simulări pe lumânări M1
+(disponibile pe același mirror, ~525k bare/simbol/an), parcurse în interiorul
+fiecărei bare M5, ca ordinea SL/TP să fie observată în loc de presupusă.
+
+**Ce NU s-a schimbat pe baza acestor cifre:** niciun parametru al SFP-ului.
+Constatarea e raportată, nu acționată — decizia e a proprietarului strategiei.
