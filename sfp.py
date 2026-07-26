@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 
 import requests
 
+from fmt import fmt_price  # aceeași formatare de preț ca în alertele de confluență
+
 log = logging.getLogger("sfp")
 
 BINANCE_BASE = "https://fapi.binance.com/fapi/v1"
@@ -248,11 +250,11 @@ def build_sfp_message(symbol, sig, bars, i, funding):
         f"🎯 <b>SETUP — SFP SWEEP &amp; RECLAIM</b>\n"
         f"⚡ <b>{sym_disp}</b> · M5 · {'▲ LONG' if d == 1 else '▼ SHORT'}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📍 Nivel măturat: <b>{kind_names.get(level['kind'], level['kind'])}</b> @ ${limit:,.4f}\n"
-        f"💰 Limit sugerat: <b>${limit:,.4f}</b> (maker; valabil ~30 min)\n"
-        f"🛑 SL structural: ${stop:,.4f} ({risk / limit * 100:.2f}%)\n"
-        f"🎯 TP1 (1R, 50%): ${tp1:,.4f} → apoi SL la BE\n"
-        f"🚀 TP2 (pool):    ${tp2:,.4f}\n"
+        f"📍 Nivel măturat: <b>{kind_names.get(level['kind'], level['kind'])}</b> @ ${fmt_price(limit)}\n"
+        f"💰 Limit sugerat: <b>${fmt_price(limit)}</b> (maker; valabil ~30 min)\n"
+        f"🛑 SL structural: ${fmt_price(stop)} ({risk / limit * 100:.2f}%)\n"
+        f"🎯 TP1 (1R, 50%): ${fmt_price(tp1)} → apoi SL la BE\n"
+        f"🚀 TP2 (pool):    ${fmt_price(tp2)}\n"
         f"🏷️ Grad: <b>{grade}</b> — {risk_note} (funding {frate * 100:+.4f}%)\n"
         f"⏱️ Time-stop: 3×M5 fără +0.5R → ieși\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"

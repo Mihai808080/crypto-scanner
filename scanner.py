@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timezone
 import requests
 
+from fmt import fmt_price  # zecimale adaptate la mărimea prețului (vezi fmt.py)
 import sfp  # Playbook 1: Sweep & Reclaim — alerte SETUP (execuție discreționară)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -614,10 +615,10 @@ def build_alert_message(symbol, cs, price):
         f"ℹ️ <i>Informativ (backtest: fără edge de intrare mecanică) — nu e semnal de execuție.</i>\n\n"
         f"{'▲' if is_long else '▼'} <b>{'LONG' if is_long else 'SHORT'} SIGNAL</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Entry:    <b>${price:,.4f}</b>\n"
-        f"🛑 SL (ATR): ${sl:,.4f}  ({sl_pct*100:.2f}%)\n"
-        f"🎯 TP1:      ${tp1:,.4f}\n"
-        f"🚀 TP2:      ${tp2:,.4f}\n"
+        f"💰 Entry:    <b>${fmt_price(price)}</b>\n"
+        f"🛑 SL (ATR): ${fmt_price(sl)}  ({sl_pct*100:.2f}%)\n"
+        f"🎯 TP1:      ${fmt_price(tp1)}\n"
+        f"🚀 TP2:      ${fmt_price(tp2)}\n"
         f"⚡ Leverage: <b>{lev}×</b>\n"
         f"📊 CS Score: <b>{cs['score']}/100</b>\n"
         f"{adx_line}"
@@ -641,7 +642,7 @@ def scan_symbol(symbol):
         cls15 = [k["c"] for k in kl15]
         cs = compute_confluence_score(price, cls15, kl15, kl1h, kl4h, bar_ts=int(time.time() * 1000))
 
-        log.info(f"{symbol:12s} price=${price:,.4f}  CS={cs['score']}/100  dir={cs['dir']}")
+        log.info(f"{symbol:12s} price=${fmt_price(price)}  CS={cs['score']}/100  dir={cs['dir']}")
 
         st = state.setdefault(symbol, {"prev_dir": 0, "last_alert_ts": 0})
         now = time.time()
@@ -830,7 +831,7 @@ def build_sweep_message(symbol, sig, price):
         f"⚡ <b>{disp}</b> · 15m\n\n"
         f"{'▲' if is_long else '▼'} <b>{'LONG' if is_long else 'SHORT'}</b> · sweep + reclaim confirmat\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Preț: <b>${price:,.4f}</b>\n"
+        f"💰 Preț: <b>${fmt_price(price)}</b>\n"
         f"📊 Scor sweep: <b>{sig['score']}/100</b>\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -906,8 +907,8 @@ def check_price_alerts():
             verb = "a trecut PESTE" if a.get("cond") == "above" else "a coborât SUB"
             send_telegram(
                 f"🔔 <b>ALERTĂ DE PREȚ</b>\n"
-                f"<b>{disp}</b> {verb} <b>{target:,.4f}</b>\n"
-                f"💰 Preț curent: <b>{p:,.4f}</b>\n"
+                f"<b>{disp}</b> {verb} <b>{fmt_price(target)}</b>\n"
+                f"💰 Preț curent: <b>{fmt_price(p)}</b>\n"
                 f"🕐 {datetime.now().strftime('%H:%M:%S')}"
             )
             log.info(f"  → Alertă de preț declanșată: {a['sym']} @ {p}")
