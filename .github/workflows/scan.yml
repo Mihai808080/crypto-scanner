@@ -56,7 +56,7 @@ jobs:
           ALERTS_URL: ${{ secrets.ALERTS_URL }}
           WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
           ALERTS_KEY: ${{ secrets.ALERTS_KEY }}
-          MIN_SCORE: "75"
+          MIN_SCORE: "80"
           SCAN_INTERVAL_SEC: "300"
           MAX_RUNTIME_SEC: "20700"   # 5h45m
           SFP_SYMBOLS: "DOGEUSDT,SOLUSDT"

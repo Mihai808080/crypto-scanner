@@ -26,7 +26,13 @@ log = logging.getLogger("confluence")
 # ─────────────────────────────────────────────
 TG_TOKEN = os.environ.get("TG_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-MIN_SCORE = int(os.environ.get("MIN_SCORE", "65"))
+MIN_SCORE = int(os.environ.get("MIN_SCORE", "80"))  # prag pe scara nouă post-Markov (7a)
+# Timeframe de EXECUȚIE. Implicit 4h: costul per trade e 0.03 R vs 0.16 R pe 15m,
+# singura schimbare cu efect măsurat asupra rentabilității. 15m rămâne opțiune
+# (EXEC_TF=15m), dar NU e testat-profitabil. Contextul (EMA) rămâne 1h + 4h.
+EXEC_TF = os.environ.get("EXEC_TF", "4h")
+# Costuri de execuție, pentru ajustarea scorului la costul real al monedei (7c).
+FEE_PER_SIDE = float(os.environ.get("FEE_PER_SIDE", "0.0005"))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))  # 5 min
 WATCHLIST_FILE = os.environ.get("WATCHLIST_FILE", "watchlist.txt")
 # SFP doar pe perechile cu edge demonstrat în backtest (DOGE clar, SOL marginal).
@@ -249,6 +255,30 @@ def get_klines(symbol, interval, limit):
     return _mexc_klines(symbol, interval, limit)
 
 
+def closed_bars(kl, interval):
+    """Taie lumânarea în formare — port 1:1 din closedBars() (confluence.js).
+
+    Exchange-ul întoarce ca ULTIMĂ lumânare pe cea neterminată. Calculând
+    scorul pe ea, un semnal apărea la minutul 3 dintr-o lumânare de 15 și
+    putea dispărea până la închidere — alerta pleca pentru un setup care nu
+    s-a confirmat niciodată. În plus, backtestul lucra pe bare închise, deci
+    măsura cu totul altceva decât făcea scanner-ul.
+    """
+    if not kl or len(kl) < 2:
+        return kl or []
+    step = _IV_SEC.get(interval, 0) * 1000 or (kl[-1]["t"] - kl[-2]["t"])
+    if not step:
+        return kl
+    now_ms = time.time() * 1000
+    return kl[:-1] if kl[-1]["t"] + step > now_ms else kl
+
+
+def get_closed_klines(symbol, interval, limit):
+    """Lumânări ÎNCHISE, garantat `limit` bucăți (cerem una în plus)."""
+    kl = closed_bars(get_klines(symbol, interval, limit + 1), interval)
+    return kl[-limit:]
+
+
 def get_ticker(symbol):
     src = _resolve_src(symbol)
     if src == "binance":
@@ -259,6 +289,110 @@ def get_ticker(symbol):
         return float(d["lastPrice"]), float(d.get("priceChangePercent", 0))
     d = _mexc_data("ticker", {"symbol": _mexc_sym(symbol)})
     return float(d["lastPrice"]), float(d.get("riseFallRate", 0)) * 100
+
+
+# Funding + Open Interest: futures. fapi.binance.com dă 451 de pe GitHub
+# Actions, așa că le luăm de la Bybit (public, accesibil de acolo). Best-effort:
+# dacă simbolul nu există pe Bybit linear sau API-ul pică, întoarcem None și
+# mesajul pur și simplu omite liniile — nimic nu se strică.
+BYBIT_BASE = "https://api.bybit.com/v5/market"
+
+
+def bybit_funding_oi(symbol):
+    """{'funding': fracție, 'oi_delta': fracție pe ~6h} sau None."""
+    try:
+        t = _get(f"{BYBIT_BASE}/tickers", {"category": "linear", "symbol": symbol.upper()}).json()
+        lst = (t.get("result") or {}).get("list") or []
+        if not lst:
+            return None
+        funding = float(lst[0].get("fundingRate")) if lst[0].get("fundingRate") not in (None, "") else None
+        oi_delta = None
+        try:
+            o = _get(f"{BYBIT_BASE}/open-interest",
+                     {"category": "linear", "symbol": symbol.upper(),
+                      "intervalTime": "1h", "limit": 7}).json()
+            pts = (o.get("result") or {}).get("list") or []
+            # Bybit întoarce cel mai recent primul; delta = (nou - vechi)/vechi.
+            if len(pts) >= 2:
+                new = float(pts[0]["openInterest"])
+                old = float(pts[-1]["openInterest"])
+                if old > 0:
+                    oi_delta = (new - old) / old
+        except Exception:
+            pass
+        if funding is None and oi_delta is None:
+            return None
+        return {"funding": funding, "oi_delta": oi_delta}
+    except Exception as e:
+        log.info(f"{symbol}: funding/OI Bybit indisponibil ({e})")
+        return None
+
+
+_slip_cache = {}  # symbol -> (ts, slip) — spread-ul nu se schimbă de la minut la minut
+
+
+def estimate_slippage(symbol, ttl=900):
+    """Slippage estimat pe un leg, ca fracțiune — jumătate din spread-ul real
+    bid/ask. Costul de 0.03 R a fost măsurat pe BTC/ETH/SOL/XRP; pe alt-urile
+    mici e semnificativ mai mare, deci trebuie măsurat per monedă, nu presupus.
+    Fallback conservator 0.0010 (0.1%) dacă orderbook-ul nu e disponibil.
+
+    Rezultatul se memorează `ttl` secunde: la 200 de monede scanate la 5 minute,
+    un apel în plus per monedă per trecere ar însemna ~57k cereri/zi degeaba.
+    """
+    hit = _slip_cache.get(symbol)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    src = _resolve_src(symbol)
+    try:
+        if src == "binance":
+            d = _get(f"{BINANCE_BASE}/ticker/bookTicker", {"symbol": symbol}).json()
+            bid, ask = float(d["bidPrice"]), float(d["askPrice"])
+        elif src == "mexc_spot":
+            d = _get(f"{MEXC_SPOT_BASE}/ticker/bookTicker", {"symbol": symbol.upper()}).json()
+            bid, ask = float(d["bidPrice"]), float(d["askPrice"])
+        else:
+            d = _mexc_data("ticker", {"symbol": _mexc_sym(symbol)})
+            bid, ask = float(d["bid1"]), float(d["ask1"])
+        mid = (bid + ask) / 2
+        if mid > 0 and ask >= bid:
+            slip = (ask - bid) / mid / 2
+            _slip_cache[symbol] = (time.time(), slip)
+            return slip
+    except Exception as e:
+        log.info(f"{symbol}: spread indisponibil ({e}) — folosesc 0.10% estimat")
+    _slip_cache[symbol] = (time.time(), 0.0010)
+    return 0.0010
+
+
+def cost_adjust(score, sl_pct, slip_est):
+    """Ajustează scorul la costul real de execuție al monedei (7c).
+
+    O monedă cu scor 85 și cost 0.4 R e mai proastă decât una cu scor 72 și cost
+    0.05 R — de aceea clasarea și alertarea se fac pe score_adj, nu pe score.
+    """
+    if not sl_pct:
+        return score, 0.0
+    cost_r = (FEE_PER_SIDE * 2 + slip_est) / sl_pct
+    return score * (1 - min(cost_r, 0.9)), cost_r
+
+
+_btc_trend_cache = {"ts": 0, "dir": 0}
+
+
+def btc_trend_dir():
+    """Direcția trendului BTC pe 4h (EMA21), memorată 10 min — pentru
+    'BTC Shield Alignment'. Refolosește sursa spot (nu e blocată)."""
+    now = time.time()
+    if now - _btc_trend_cache["ts"] < 600:
+        return _btc_trend_cache["dir"]
+    try:
+        kl4h = get_closed_klines("BTCUSDT", "4h", 30)
+        d = htf_trend_dir(kl4h)
+    except Exception:
+        d = 0
+    _btc_trend_cache.update({"ts": now, "dir": d})
+    return d
 
 
 def get_price(symbol):
@@ -381,40 +515,113 @@ def calc_adx(klines, period=14):
     return ([adx[0]] * max(0, pad)) + adx
 
 
-def compute_markov(closes, win=12):
-    if len(closes) < win * 5:
-        return None
-    BU, BE = 0.008, -0.008
-    labels = []
-    for i, c in enumerate(closes):
-        if i < win:
-            labels.append(0)
-            continue
-        r = (c - closes[i - win]) / closes[i - win]
-        labels.append(1 if r >= BU else 2 if r <= BE else 0)
-    mat = [[0, 0, 0] for _ in range(3)]
-    n_trans = 0
-    for i in range(0, len(labels) - win, win):
-        mat[labels[i]][labels[i + win]] += 1
-        n_trans += 1
-    cur = labels[-1]
-    row_n = sum(mat[cur])
-    # Cu prea puține observații matricea e zgomot pur — nu emitem semnal.
-    # Pragurile: minim 30 tranziții totale și minim 8 din starea curentă.
-    if n_trans < 30 or row_n < 8:
-        return None
-    prob = []
-    for row in mat:
-        s = sum(row)
-        prob.append([v / s for v in row] if s else [1 / 3] * 3)
-    sig = prob[cur][1] - prob[cur][2]
-    return {"prob": prob, "cur": cur, "sig": sig, "stk": prob[cur][cur], "n": n_trans}
-
-
 def is_good_session_at(ts_ms):
     # Londra + New York (8-22 UTC) — scris ca un singur interval
     h = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).hour
     return 8 <= h < 22
+
+
+# ─────────────────────────────────────────────
+# DETALII STIL "APEX" — toate din klines-urile pe care le avem deja (gratis)
+# Nu ating scorul: sunt straturi informative pentru mesajul de alertă.
+# ─────────────────────────────────────────────
+def rvol(kl, win=30):
+    """Volum relativ: ultima bară față de media ultimelor `win` (fără ea)."""
+    if len(kl) < win + 2:
+        return None
+    vols = [k["v"] for k in kl[-(win + 1):-1]]
+    avg = sum(vols) / len(vols) if vols else 0
+    return kl[-1]["v"] / avg if avg else None
+
+
+def volume_zscore(kl, win=30):
+    """Cât de statistic-anormal e volumul ultimei bare (în deviații standard)."""
+    if len(kl) < win + 2:
+        return None
+    vols = [k["v"] for k in kl[-(win + 1):-1]]
+    n = len(vols)
+    mean = sum(vols) / n
+    var = sum((v - mean) ** 2 for v in vols) / n
+    sd = var ** 0.5
+    return (kl[-1]["v"] - mean) / sd if sd else None
+
+
+def volume_poc(kl, lookback=100, bins=40):
+    """Point of Control: prețul cu cel mai mult volum tranzacționat (aprox.
+    din klines — distribuie volumul fiecărei bare la prețul ei tipic)."""
+    recent = kl[-lookback:]
+    if len(recent) < 5:
+        return None
+    hi = max(k["h"] for k in recent)
+    lo = min(k["l"] for k in recent)
+    if hi <= lo:
+        return None
+    step = (hi - lo) / bins
+    buckets = [0.0] * bins
+    for k in recent:
+        tp = (k["h"] + k["l"] + k["c"]) / 3
+        b = min(bins - 1, max(0, int((tp - lo) / step)))
+        buckets[b] += k["v"]
+    top = max(range(bins), key=lambda b: buckets[b])
+    return lo + (top + 0.5) * step
+
+
+def buy_vol_pct(kl, bars=1):
+    """Procent de volum de cumpărare (taker buy) pe ultimele `bars` bare.
+    Doar unde avem taker-buy real (Binance); pe MEXC 'tb' e neutru → ~50%."""
+    seg = kl[-bars:]
+    tot = sum(k["v"] for k in seg)
+    buy = sum(k.get("tb", k["v"] / 2) for k in seg)
+    return 100 * buy / tot if tot else None
+
+
+def cvd_word(kl, win=20):
+    """Direcția presiunii de agresiune pe ultima fereastră, în cuvinte."""
+    cvd = calc_cvd(kl[-win:])
+    if len(cvd) < 5:
+        return None, 0
+    d = cvd[-1] - cvd[-5]
+    if d > 0:
+        return "acumulare 🟢", 1
+    if d < 0:
+        return "distribuție 🔴", -1
+    return "neutru", 0
+
+
+def setup_label(direction, rsi_val, rvol_val, near_fib):
+    """Nume de setup ales din stare (echivalentul etichetei Apex)."""
+    long = direction == 1
+    if rsi_val is not None and ((long and rsi_val < 40) or (not long and rsi_val > 60)):
+        return "Oversold Rebound" if long else "Overbought Rejection"
+    if rvol_val is not None and rvol_val >= 2:
+        return "Momentum Breakout" if long else "Momentum Breakdown"
+    if near_fib:
+        return "Fib Support Bounce" if long else "Fib Resistance Reject"
+    return "Bullish Confluence" if long else "Bearish Confluence"
+
+
+def dca_ladder(price, sl_pct, direction, fracs=(0.3, 0.6, 0.9)):
+    """Nivele de intrare scalată (DEFENDER-ele Apex), plasate ca fracțiuni din
+    distanța până la SL — mereu ordonate între entry și stop, indiferent de ATR."""
+    out = []
+    for f in fracs:
+        off = f * sl_pct
+        lvl = price * (1 - direction * off)
+        out.append((lvl, -off * 100))
+    return out
+
+
+def liq_prices(price, direction, levs=(2, 5), mmr=0.005):
+    """Preț de lichidare REAL per levier (isolated). NU inventăm ca Apex un liq
+    la -4.6% pentru 2× — un 2× real se lichidează pe la -50%."""
+    out = []
+    for L in levs:
+        if direction == 1:
+            liq = price * (1 - 1 / L + mmr)
+        else:
+            liq = price * (1 + 1 / L - mmr)
+        out.append((L, liq, (liq - price) / price * 100))
+    return out
 
 
 # ─────────────────────────────────────────────
@@ -424,22 +631,11 @@ def compute_confluence_score(price, cls15, kl15, kl1h, kl4h, bar_ts=None):
     factors = []
     total = 0
 
-    # 1) Markov M15 — max 8 (redus de la 20: cu ~16-30 tranziții observabile,
-    # semnalul e prea zgomotos statistic ca să fie factorul dominant)
-    mkv = compute_markov(cls15, 12)
-    markov_pts, markov_dir = 0, 0
-    if mkv:
-        a = abs(mkv["sig"])
-        if a >= 0.30:
-            markov_pts, markov_dir = 8, (1 if mkv["sig"] > 0 else -1)
-        elif a >= 0.20:
-            markov_pts, markov_dir = 5, (1 if mkv["sig"] > 0 else -1)
-        elif a >= 0.10:
-            markov_pts, markov_dir = 3, (1 if mkv["sig"] > 0 else -1)
-    total += markov_pts
-    factors.append(("Markov M15", markov_pts, 8, markov_dir))
+    # (Markov ELIMINAT: 0 puncte în 100% din cazuri pe date reale, corelație cu
+    #  randamentul următoarelor 12 bare +0.015 (t=0.81) — factor mort. achievable
+    #  scade de la 58 la 50, deci scorurile cresc ~16%; pragurile recalibrate.)
 
-    # 2) MTF EMA Trend — max 20
+    # 1) MTF EMA Trend — max 20
     ema_pts, ema_dir = 0, 0
     cls1h = [k["c"] for k in kl1h]
     cls4h = [k["c"] for k in kl4h]
@@ -456,9 +652,10 @@ def compute_confluence_score(price, cls15, kl15, kl1h, kl4h, bar_ts=None):
             e21_1h, e50_1h = ema(cls1h, 21), ema(cls1h, 50)
             bull1h = price > e21_1h[-1] > e50_1h[-1]
             bear1h = price < e21_1h[-1] < e50_1h[-1]
-            if bull1h:
+            # aliniere 1h — puncte DOAR dacă întărește direcția 15m (ema_dir)
+            if bull1h and ema_dir > 0:
                 ema_pts += 6
-            if bear1h:
+            if bear1h and ema_dir < 0:
                 ema_pts += 6
         if len(cls4h) >= 21:
             e21_4h = ema(cls4h, 21)
@@ -527,7 +724,7 @@ def compute_confluence_score(price, cls15, kl15, kl1h, kl4h, bar_ts=None):
     factors.append(("Liq Sweep", 0, 0, 0))
 
     # Normalizare: 0-100 raportat la punctajul maxim REALIZABIL aici
-    achievable = sum(mx for _, _, mx, _ in factors)  # 8+20+10+10+10 = 58
+    achievable = sum(mx for _, _, mx, _ in factors)  # 20+10+10+10 = 50 (era 58 cu Markov)
     total = round(100 * total / achievable) if achievable else 0
 
     dir_scores = {-1: 0, 0: 0, 1: 0}
@@ -590,39 +787,139 @@ def send_telegram(text):
         return False
 
 
-def build_alert_message(symbol, cs, price):
+def build_alert_message(symbol, cs, price, kl15=None, live_price=None, extras=None):
+    """Mesaj în stil «Apex» — straturi de detaliu peste scorul de confluență.
+    Toate nivelurile în PROCENTE (fără sume $, la cererea userului). Câmpurile
+    de futures (funding/OI/BTC) vin prin `extras`; lipsa lor omite doar liniile."""
     is_long = cs["dir"] == 1
+    extras = extras or {}
     atr_pct = cs.get("atr_pct") or 0.0035
     # Podea de 0.4%: sub asta, taxele round-trip (~0.1%) + slippage devin
     # o fracțiune prea mare din distanța de stop și edge-ul dispare.
     sl_pct = max(0.004, atr_pct * 1.2)
-    tp1_pct, tp2_pct = sl_pct * 1.5, sl_pct * 3
+    tp1_pct, tp2_pct, tp3_pct = sl_pct * 1.5, sl_pct * 3, sl_pct * 5
     sl = price * (1 - sl_pct) if is_long else price * (1 + sl_pct)
-    tp1 = price * (1 + tp1_pct) if is_long else price * (1 - tp1_pct)
-    tp2 = price * (1 + tp2_pct) if is_long else price * (1 - tp2_pct)
+
+    def tgt(pct):
+        return price * (1 + pct) if is_long else price * (1 - pct)
+
+    tp1, tp2, tp3 = tgt(tp1_pct), tgt(tp2_pct), tgt(tp3_pct)
     # Leverage temperat: 20× cu SL de câteva zecimi de procent înseamnă că
     # taxele+slippage-ul mănâncă o parte mare din edge; 5-10× e sustenabil.
-    lev = 10 if cs["score"] >= 80 else 7 if cs["score"] >= 65 else 5
+    lev = 10 if cs["score"] >= 93 else 7 if cs["score"] >= 75 else 5  # tiere recalibrate post-Markov
+
+    # --- DEFENDER / DCA (fracțiuni din distanța până la SL) ---
+    dca = dca_ladder(price, sl_pct, cs["dir"])
+    dca_lines = "".join(
+        f"🛡 DCA {i+1} ({pct:+.1f}%):  ${fmt_price(lvl)}\n"
+        for i, (lvl, pct) in enumerate(dca)
+    )
+
+    # --- Liq real (isolated) pentru levierul sugerat + referință conservatoare 2× ---
+    liqs = liq_prices(price, cs["dir"], levs=(2, lev) if lev != 2 else (2,))
+    liq_line = "⚙️ Liq real: " + " · ".join(
+        f"{L}× ${fmt_price(lp)} ({lpct:+.1f}%)" for L, lp, lpct in liqs
+    ) + "\n"
+
+    # --- Detalii de order-flow / volum (din klines) ---
+    detail_lines = ""
+    setup = ""
+    if kl15:
+        rv = rvol(kl15)
+        vz = volume_zscore(kl15)
+        poc = volume_poc(kl15)
+        bp = buy_vol_pct(kl15, bars=1)
+        cvd_txt, _ = cvd_word(kl15)
+        r_series = rsi([k["c"] for k in kl15], 14)
+        rsi_val = r_series[-1] if r_series else None
+        near_fib = any(n == "Fibonacci" and p > 0 for n, p, m, d in cs["factors"])
+        setup = setup_label(cs["dir"], rsi_val, rv, near_fib)
+        vol_bits = []
+        if rv is not None:
+            vol_bits.append(f"RVOL {rv:.1f}×")
+        if vz is not None:
+            vol_bits.append(f"Vol Z {vz:+.1f}σ")
+        if vol_bits:
+            detail_lines += "📊 " + " · ".join(vol_bits) + "\n"
+        flow_bits = []
+        if cvd_txt:
+            flow_bits.append(f"CVD {cvd_txt}")
+        if bp is not None:
+            flow_bits.append(f"buy {bp:.0f}%")
+        if flow_bits:
+            detail_lines += "🌊 " + " · ".join(flow_bits) + "\n"
+        if poc:
+            detail_lines += f"🧲 POC: ${fmt_price(poc)}\n"
+
+    # --- Funding / OI (Bybit) ---
+    fund_bits = []
+    if extras.get("funding") is not None:
+        fund_bits.append(f"funding {extras['funding']*100:+.3f}%")
+    if extras.get("oi_delta") is not None:
+        arrow = "🟢" if extras["oi_delta"] >= 0 else "🔴"
+        fund_bits.append(f"OI ~6h {extras['oi_delta']*100:+.1f}% {arrow}")
+    fund_line = ("💸 " + " · ".join(fund_bits) + "\n") if fund_bits else ""
+
+    # --- BTC Shield Alignment ---
+    btc_line = ""
+    bd = extras.get("btc_dir")
+    if bd is not None:
+        if bd == 0:
+            btc_line = "🛡 BTC: neutru\n"
+        else:
+            aligned = bd == cs["dir"]
+            word = "urcă" if bd == 1 else "coboară"
+            btc_line = f"🛡 BTC: {'aliniat 🟢' if aligned else 'contra ⚠️'} ({word})\n"
+
+    # --- Clasare în univers (7b): un scor singur nu spune nimic ---
+    uni_line = ""
+    if extras.get("uni_total"):
+        uni_line = (f"🏁 Rang: <b>{extras['uni_rank']}/{extras['uni_total']}</b>"
+                    f" · percentila {extras['uni_pct']:.0f}"
+                    f" · mediana univers {extras['uni_median']:.0f}\n")
+    # --- Cost real de execuție (7c) ---
+    cost_line = ""
+    if extras.get("cost_r") is not None:
+        cost_line = (f"🧾 Cost: <b>{extras['cost_r']:.2f} R</b>"
+                     f" · scor ajustat <b>{extras.get('score_adj', 0):.0f}</b>\n")
+
     factor_lines = "\n".join(
         f"{'✅' if pts >= mx * 0.6 else '⚠️'} {name}: {pts}/{mx}"
         for name, pts, mx, d in cs["factors"] if mx > 0
     )
     adx_line = f"📈 ADX: {cs.get('adx', 0):.0f} (×{cs.get('adx_mult', 1):.2f})\n"
+    # Cât s-a mișcat prețul de la închiderea barei de semnal până acum — asta e
+    # slippage-ul pe care îl plătești dacă intri în clipa asta.
+    slip_line = ""
+    if live_price and price:
+        d = (live_price - price) / price * 100
+        if abs(d) >= 0.05:
+            slip_line = f"📍 Preț acum:  ${fmt_price(live_price)}  ({d:+.2f}% față de semnal)\n"
     sym_disp = symbol.replace("USDT", "/USDT")
+    setup_txt = f"  ·  Setup: {setup}" if setup else ""
     return (
-        f"📊 <b>CONTEXT — CONFLUENCE ENGINE</b>\n"
-        f"⚡ <b>{sym_disp}</b> · 15m\n"
-        f"ℹ️ <i>Informativ (backtest: fără edge de intrare mecanică) — nu e semnal de execuție.</i>\n\n"
-        f"{'▲' if is_long else '▼'} <b>{'LONG' if is_long else 'SHORT'} SIGNAL</b>\n"
+        f"📊 <b>{sym_disp} · {'LONG ▲' if is_long else 'SHORT ▼'} · {EXEC_TF}</b>\n"
+        f"🧠 Score: <b>{cs['score']}/100</b>{setup_txt}\n"
+        f"{uni_line}"
+        f"{cost_line}"
+        f"ℹ️ <i>Informativ (backtest: fără edge de intrare mecanică) — nu e semnal de execuție.</i>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Entry:    <b>${fmt_price(price)}</b>\n"
-        f"🛑 SL (ATR): ${fmt_price(sl)}  ({sl_pct*100:.2f}%)\n"
-        f"🎯 TP1:      ${fmt_price(tp1)}\n"
-        f"🚀 TP2:      ${fmt_price(tp2)}\n"
-        f"⚡ Leverage: <b>{lev}×</b>\n"
-        f"📊 CS Score: <b>{cs['score']}/100</b>\n"
+        f"💰 Entry:    <b>${fmt_price(price)}</b>  <i>(close bară închisă)</i>\n"
+        f"{slip_line}"
+        f"{dca_lines}"
+        f"🛑 SL (ATR {sl_pct*100:.1f}%): ${fmt_price(sl)}\n"
+        f"🎯 TP1 (+{tp1_pct*100:.1f}%): ${fmt_price(tp1)} — vinde 25%\n"
+        f"🎯 TP2 (+{tp2_pct*100:.1f}%): ${fmt_price(tp2)} — vinde 25%\n"
+        f"🎯 TP3 (+{tp3_pct*100:.1f}%): ${fmt_price(tp3)} — vinde 50%\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚡ Leverage sugerat: <b>{lev}×</b>\n"
+        f"{liq_line}"
+        f"{fund_line}"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{detail_lines}"
+        f"{btc_line}"
         f"{adx_line}"
-        f"🕐 Ora:      {datetime.now().strftime('%H:%M:%S')}\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"<b>Factori:</b>\n{factor_lines}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -633,34 +930,82 @@ def build_alert_message(symbol, cs, price):
 # ─────────────────────────────────────────────
 # SCAN LOOP
 # ─────────────────────────────────────────────
-def scan_symbol(symbol):
+def evaluate_symbol(symbol):
+    """Faza 1: calculează scorul, FĂRĂ să alerteze. Întoarce dict sau None.
+
+    Alertarea e separată fiindcă un scor n-are sens singur: într-un scan de 200
+    de monede, maximul e maximul a 200 de trageri dintr-o distribuție fără edge
+    (în medie 3.3 SE peste zero). Trebuie clasat față de univers — vezi scan_pass.
+    """
     try:
-        kl15 = get_klines(symbol, "15m", 200)
-        kl1h = get_klines(symbol, "1h", 60)
-        kl4h = get_klines(symbol, "4h", 30)
-        price, chg = get_ticker(symbol)
-        cls15 = [k["c"] for k in kl15]
-        cs = compute_confluence_score(price, cls15, kl15, kl1h, kl4h, bar_ts=int(time.time() * 1000))
+        # DOAR lumânări închise — semnalul trebuie să fie confirmat, nu în curs.
+        # kl_exec = timeframe-ul de EXECUȚIE (implicit 4h); contextul rămâne 1h+4h.
+        kl_exec = get_closed_klines(symbol, EXEC_TF, 200)
+        kl1h = get_closed_klines(symbol, "1h", 60)
+        kl4h = get_closed_klines(symbol, "4h", 30)
+        if not kl_exec:
+            log.warning(f"{symbol}: nicio lumânare închisă — sar peste")
+            return None
+        bar_ts = kl_exec[-1]["t"]
+        # Prețul pentru scor = close-ul ultimei bare ÎNCHISE (ca în backtest).
+        # Prețul live se ia separat, doar ca să arătăm cât s-a mișcat între timp.
+        price = kl_exec[-1]["c"]
+        try:
+            live_price, _chg = get_ticker(symbol)
+        except Exception:
+            live_price = price
+        cls = [k["c"] for k in kl_exec]
+        cs = compute_confluence_score(price, cls, kl_exec, kl1h, kl4h, bar_ts=bar_ts)
 
-        log.info(f"{symbol:12s} price=${fmt_price(price)}  CS={cs['score']}/100  dir={cs['dir']}")
+        sl_pct = max(0.004, (cs.get("atr_pct") or 0.0035) * 1.2)
+        slip_est = estimate_slippage(symbol)
+        score_adj, cost_r = cost_adjust(cs["score"], sl_pct, slip_est)
 
-        st = state.setdefault(symbol, {"prev_dir": 0, "last_alert_ts": 0})
-        now = time.time()
-        if (
-            cs["score"] >= MIN_SCORE
-            and cs["dir"] != 0
-            and cs["dir"] != st["prev_dir"]
-            and now - st["last_alert_ts"] > 5 * 60
-        ):
-            st["prev_dir"] = cs["dir"]
-            st["last_alert_ts"] = now
-            msg = build_alert_message(symbol, cs, price)
-            if send_telegram(msg):
-                log.info(f"  → Alertă trimisă pentru {symbol}")
-        elif cs["dir"] == 0:
-            st["prev_dir"] = 0
+        log.info(f"{symbol:12s} price=${fmt_price(price)}  CS={cs['score']}/100  "
+                 f"adj={score_adj:.0f}  cost={cost_r:.2f}R  dir={cs['dir']}")
+        return {"symbol": symbol, "cs": cs, "price": price, "live_price": live_price,
+                "kl": kl_exec, "bar_ts": bar_ts, "score_adj": score_adj,
+                "cost_r": cost_r, "slip_est": slip_est}
     except Exception as e:
         log.error(f"Eroare la scanarea {symbol}: {e}")
+        return None
+
+
+def alert_symbol(ev, uni):
+    """Faza 2: alertează pentru o evaluare, dacă trece pragul și anti-spam-ul.
+    `uni` = statisticile universului din bara curentă (rang, percentilă, mediană)."""
+    symbol, cs, bar_ts = ev["symbol"], ev["cs"], ev["bar_ts"]
+    st = state.setdefault(symbol, {"prev_dir": 0, "last_alert_ts": 0, "last_bar_ts": 0})
+    now = time.time()
+    if cs["dir"] == 0:
+        st["prev_dir"] = 0
+        return
+    # Pragul se aplică pe scorul AJUSTAT LA COST, nu pe cel brut (7c).
+    if not (
+        ev["score_adj"] >= MIN_SCORE
+        and cs["dir"] != st["prev_dir"]
+        # O bară închisă e evaluată de mai multe ori (scanăm mai des decât
+        # durează bara). Fără asta, aceeași lumânare putea alerta de 3 ori.
+        and bar_ts != st.get("last_bar_ts")
+        and now - st["last_alert_ts"] > 5 * 60
+    ):
+        return
+    st["prev_dir"] = cs["dir"]
+    st["last_alert_ts"] = now
+    st["last_bar_ts"] = bar_ts
+    # Datele de futures (Bybit) + BTC se cer DOAR acum, la alertă — nu
+    # la fiecare scanare a fiecărui simbol (rare = puține cereri în plus).
+    extras = {"btc_dir": btc_trend_dir()}
+    fo = bybit_funding_oi(symbol)
+    if fo:
+        extras.update(fo)
+    extras.update(uni)
+    extras["score_adj"] = ev["score_adj"]
+    extras["cost_r"] = ev["cost_r"]
+    msg = build_alert_message(symbol, cs, ev["price"], kl15=ev["kl"],
+                              live_price=ev["live_price"], extras=extras)
+    if send_telegram(msg):
+        log.info(f"  → Alertă trimisă pentru {symbol}")
 
 
 # ─────────────────────────────────────────────
@@ -817,8 +1162,11 @@ def sweep_signal(kl, kl4h, bar_ts=None):
     if bar_ts:
         dom = datetime.fromtimestamp(bar_ts / 1000, tz=timezone.utc).day
         pm = prev_month_dir(kl4h, bar_ts)
+        # redus de la 15 la 5: pm == -direction etichetează toate sweep-urile unei
+        # luni la fel → ~30 observații independente în 2,5 ani, iar 52% vs 39% e
+        # la ~1.6 SE. Boost mic, nu factor dominant.
         if dom <= 12 and pm != 0 and pm == -direction:
-            total += 15
+            total += 5
 
     return {"score": min(100, total), "dir": direction}
 
@@ -828,7 +1176,7 @@ def build_sweep_message(symbol, sig, price):
     disp = symbol.replace("USDT", "/USDT")
     return (
         f"🎯 <b>LIQUIDITY SWEEP</b>\n"
-        f"⚡ <b>{disp}</b> · 15m\n\n"
+        f"⚡ <b>{disp}</b> · {EXEC_TF}\n\n"
         f"{'▲' if is_long else '▼'} <b>{'LONG' if is_long else 'SHORT'}</b> · sweep + reclaim confirmat\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"💰 Preț: <b>${fmt_price(price)}</b>\n"
@@ -842,19 +1190,30 @@ def build_sweep_message(symbol, sig, price):
 def scan_symbol_sweep(symbol):
     """Rulează Liquidity Sweep pe un simbol și alertează la sweep confirmat nou."""
     try:
-        kl15 = get_klines(symbol, "15m", 200)
-        kl4h = get_klines(symbol, "4h", 30)
-        sig = sweep_signal(kl15, kl4h, int(time.time() * 1000))
-        st = sweep_state.setdefault(symbol, {"prev_dir": 0, "last_alert_ts": 0})
+        # Și sweep-ul doar pe bare închise: un „reclaim" la mijlocul barei se
+        # poate anula până la închidere. Timeframe-ul de execuție = EXEC_TF (4h),
+        # ca măsurătoarea (Sweep pooled pe 4h) și scanner-ul să vadă același lucru.
+        kl15 = get_closed_klines(symbol, EXEC_TF, 200)
+        kl4h = get_closed_klines(symbol, "4h", 30)
+        if not kl15:
+            return
+        bar_ts = kl15[-1]["t"]
+        sig = sweep_signal(kl15, kl4h, bar_ts)
+        st = sweep_state.setdefault(symbol, {"prev_dir": 0, "last_alert_ts": 0, "last_bar_ts": 0})
         if not sig or sig["dir"] == 0:
             st["prev_dir"] = 0
             return
         price = kl15[-1]["c"]
         log.info(f"{symbol:12s} SWEEP score={sig['score']}/100  dir={sig['dir']}")
         now = time.time()
-        if sig["dir"] != st["prev_dir"] and now - st.get("last_alert_ts", 0) > 5 * 60:
+        if (
+            sig["dir"] != st["prev_dir"]
+            and bar_ts != st.get("last_bar_ts")
+            and now - st.get("last_alert_ts", 0) > 5 * 60
+        ):
             st["prev_dir"] = sig["dir"]
             st["last_alert_ts"] = now
+            st["last_bar_ts"] = bar_ts
             if send_telegram(build_sweep_message(symbol, sig, price)):
                 log.info(f"  → Alertă SWEEP trimisă pentru {symbol}")
     except Exception as e:
@@ -947,14 +1306,34 @@ def scan_pass():
     # Alertele de preț ale userului (rapid, un fetch de preț per simbol).
     check_price_alerts()
     wl = load_watchlist_cloud()
-    log.info(f"Scanez {len(wl)} simboluri: {', '.join(w['sym'] for w in wl)}")
+    log.info(f"Scanez {len(wl)} simboluri ({EXEC_TF}): {', '.join(w['sym'] for w in wl)}")
+
+    # ── Faza 1: evaluăm TOT universul, fără să alertăm ──
+    evals = []
     for w in wl:
         sym, strat = w["sym"], w.get("strat", "conf")
         if strat in ("conf", "both"):
-            scan_symbol(sym)  # Confluence Score
+            ev = evaluate_symbol(sym)
+            if ev:
+                evals.append(ev)
         if strat in ("sweep", "both"):
-            scan_symbol_sweep(sym)  # Liquidity Sweep
+            scan_symbol_sweep(sym)  # Liquidity Sweep (independent de clasare)
         time.sleep(1)  # mic delay între simboluri, să nu lovim rate-limit Binance
+
+    # ── Faza 2: clasare pe univers, apoi alertare de la cel mai bun în jos ──
+    # Un scor de 82 nu înseamnă nimic singur: trebuie raportat la ce a scos tot
+    # universul în aceeași bară (7b). Ordonăm pe score_adj, nu pe score brut (7c).
+    if evals:
+        evals.sort(key=lambda e: e["score_adj"], reverse=True)
+        adj = sorted(e["score_adj"] for e in evals)
+        n = len(adj)
+        median = adj[n // 2] if n % 2 else (adj[n // 2 - 1] + adj[n // 2]) / 2
+        for rank, ev in enumerate(evals, start=1):
+            # percentila = % din univers pe care îl depășește scorul ăsta
+            below = sum(1 for a in adj if a < ev["score_adj"])
+            uni = {"uni_rank": rank, "uni_total": n,
+                   "uni_pct": 100.0 * below / n, "uni_median": median}
+            alert_symbol(ev, uni)
     # SFP dedicat (Playbook 1) — rulează doar în ferestrele Londra/NY open;
     # în afara lor, scan_sfp iese imediat, fără apeluri API.
     for sym in SFP_SYMBOLS:
