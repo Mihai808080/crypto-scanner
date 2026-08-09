@@ -355,67 +355,64 @@ def bybit_funding_oi(symbol):
 # vin tot de la Bybit, deci prețul, costul și funding-ul sunt de pe ACELAȘI
 # venue — cel pe care s-ar executa efectiv un trade cu levier.
 # ─────────────────────────────────────────────
-_BYBIT_IV = {"1m": "1", "5m": "5", "15m": "15", "30m": "30",
-             "1h": "60", "4h": "240", "1d": "D"}
 
 
-def bybit_universe(top_n=200, min_turnover=1e6):
-    """Top-N perps USDT după turnover 24h. Întoarce listă de dict-uri cu tot ce
-    trebuie pentru scor + cost, dintr-un singur apel."""
-    r = _get(f"{BYBIT_BASE}/tickers", {"category": "linear"}, timeout=25)
-    rows = (r.json().get("result") or {}).get("list") or []
+# Perechi de stablecoin/wrapped — volum uriaș, dar nu au ce semnal să dea.
+_UNI_SKIP = ("USDCUSDT", "FDUSDUSDT", "TUSDUSDT", "BUSDUSDT", "DAIUSDT",
+             "USDPUSDT", "EURUSDT", "AEURUSDT", "USD1USDT", "PAXGUSDT",
+             "WBTCUSDT", "WBETHUSDT", "BETHUSDT")
+
+
+def build_universe(top_n=200, min_turnover=1e6):
+    """Top-N perechi USDT după volum 24h, din mirror-ul Binance + spread real.
+
+    ATENȚIE — de ce NU Bybit aici: `api.bybit.com` întoarce **403 Forbidden** de
+    pe runnerele GitHub Actions (exact ca `api.binance.com` → 451). Local merge,
+    deci un test de pe laptop NU dovedește nimic. `data-api.binance.vision` e
+    singura sursă de piață completă accesibilă de acolo, iar klines-urile vin tot
+    prin lanțul obișnuit (mirror → MEXC spot → MEXC futures), care s-a dovedit
+    functional pe Actions.
+
+    Două apeluri pentru toată piața: /ticker/24hr (volum) + /ticker/bookTicker
+    (bid/ask pentru cost). Funding-ul rămâne best-effort prin Bybit — lipsa lui
+    omite doar o linie din alertă.
+    """
+    vols = _get(f"{BINANCE_BASE}/ticker/24hr", timeout=30).json()
+    try:
+        books = {b["symbol"]: b for b in _get(f"{BINANCE_BASE}/ticker/bookTicker", timeout=30).json()}
+    except Exception as e:
+        log.warning(f"bookTicker indisponibil ({e}) — folosesc 0.10% slippage estimat")
+        books = {}
+
     out = []
-    for x in rows:
+    for x in vols:
         sym = x.get("symbol", "")
-        if not sym.endswith("USDT"):
+        if not sym.endswith("USDT") or sym in _UNI_SKIP:
             continue
         try:
-            turnover = float(x.get("turnover24h") or 0)
-            bid, ask = float(x.get("bid1Price") or 0), float(x.get("ask1Price") or 0)
+            turnover = float(x.get("quoteVolume") or 0)
         except (TypeError, ValueError):
             continue
-        if turnover < min_turnover or bid <= 0 or ask < bid:
+        if turnover < min_turnover:
             continue
-        mid = (bid + ask) / 2
-        try:
-            funding = float(x["fundingRate"]) if x.get("fundingRate") not in (None, "") else None
-        except (TypeError, ValueError):
-            funding = None
-        out.append({
-            "sym": sym,
-            "turnover": turnover,
-            # slippage estimat pe un leg = jumătate din spread
-            "slip": (ask - bid) / mid / 2 if mid else 0.001,
-            "funding": funding,
-        })
+        slip = 0.0010
+        b = books.get(sym)
+        if b:
+            try:
+                bid, ask = float(b["bidPrice"]), float(b["askPrice"])
+                mid = (bid + ask) / 2
+                if mid > 0 and ask >= bid:
+                    slip = (ask - bid) / mid / 2   # slippage pe un leg
+            except (TypeError, ValueError, KeyError):
+                pass
+        out.append({"sym": sym, "turnover": turnover, "slip": slip, "funding": None})
     out.sort(key=lambda d: d["turnover"], reverse=True)
     return out[:top_n]
 
 
-def bybit_klines(symbol, interval, limit):
-    """Klines Bybit linear, cronologic. Bybit le dă cel mai recent primul.
-    Nu expune taker-buy volume → 'tb' neutru (CVD nu inventează direcție)."""
-    iv = _BYBIT_IV.get(interval)
-    if not iv:
-        raise ValueError(f"interval nesuportat pe Bybit: {interval}")
-    r = _get(f"{BYBIT_BASE}/kline",
-             {"category": "linear", "symbol": symbol, "interval": iv, "limit": min(1000, limit)})
-    rows = (r.json().get("result") or {}).get("list") or []
-    if not rows:
-        raise ValueError(f"Bybit fără lumânări pentru {symbol} {interval}")
-    rows = sorted(rows, key=lambda k: int(k[0]))
-    out = []
-    for k in rows:
-        v = float(k[5])
-        out.append({"t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-                    "c": float(k[4]), "v": v, "tb": v / 2})
-    return out[-limit:]
-
-
-def bybit_closed_klines(symbol, interval, limit):
-    """Lumânări ÎNCHISE de la Bybit — aceeași regulă ca peste tot."""
-    kl = closed_bars(bybit_klines(symbol, interval, limit + 1), interval)
-    return kl[-limit:]
+# NU adăuga aici klines de la Bybit: `api.bybit.com` e 403 de pe runnerele
+# GitHub Actions. Klines-urile trec prin get_closed_klines (mirror Binance →
+# MEXC spot → MEXC futures), singurul lanț dovedit functional acolo.
 
 
 _slip_cache = {}  # symbol -> (ts, slip) — spread-ul nu se schimbă de la minut la minut
@@ -1440,7 +1437,7 @@ def scan_universe():
     uni_state["last_bar"] = cur_bar
 
     try:
-        uni = bybit_universe(UNIVERSE_SIZE)
+        uni = build_universe(UNIVERSE_SIZE)
     except Exception as e:
         log.error(f"Nu am putut construi universul: {e}")
         return
@@ -1450,12 +1447,14 @@ def scan_universe():
     for d in uni:
         sym = d["sym"]
         try:
-            kl = bybit_closed_klines(sym, EXEC_TF, 200)
+            # get_closed_klines = lantul mirror Binance → MEXC spot → MEXC futures,
+            # singurul care functioneaza de pe runnerele GitHub (Bybit dă 403).
+            kl = get_closed_klines(sym, EXEC_TF, 200)
             if len(kl) < 100:
                 continue
             # pe 4h seria proprie E contextul de 4h (ca in StrategyLab)
-            kl4h = kl if EXEC_TF == "4h" else bybit_closed_klines(sym, "4h", 30)
-            kl1h = kl if EXEC_TF == "1h" else bybit_closed_klines(sym, "1h", 60)
+            kl4h = kl if EXEC_TF == "4h" else get_closed_klines(sym, "4h", 30)
+            kl1h = kl if EXEC_TF == "1h" else get_closed_klines(sym, "1h", 60)
             price, bar_ts = kl[-1]["c"], kl[-1]["t"]
             cs = compute_confluence_score(price, [k["c"] for k in kl], kl, kl1h, kl4h, bar_ts=bar_ts)
             if cs["dir"] == 0:
@@ -1556,7 +1555,7 @@ def resolve_open_signals():
         if time.time() * 1000 - oldest < step * 1.5:
             continue
         try:
-            kl = bybit_closed_klines(sym, EXEC_TF, 200)
+            kl = get_closed_klines(sym, EXEC_TF, 200)
         except Exception as e:
             log.info(f"  resolve {sym}: klines indisponibile ({e})")
             continue
