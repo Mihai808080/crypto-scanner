@@ -61,6 +61,12 @@ SIGNALS_URL = os.environ.get("SIGNALS_URL", "")
 # 200 nu e ales estetic: la ~4.5 semnale/zi, ~400 de tranzactii (minimul ca sa
 # distingi edge de zgomot) se aduna in ~3 luni. Pe 4 monede ar dura ~12 ani.
 UNIVERSE_SIZE = int(os.environ.get("UNIVERSE_SIZE", "200"))
+# Pragul de LOGARE, separat de cel de alertare (MIN_SCORE). Deliberat mai jos:
+# logam si semnale mediocre ca sa putem testa daca scorul SEPARA in general
+# (un 85 chiar bate un 62?). Daca nu separa, niciun prag nu conteaza — si asta
+# e mai important de aflat decat "bucket-ul de 80+ bate null-ul?".
+# Ales INAINTE de a vedea orice rezultat; nu se modifica dupa.
+LOG_MIN_SCORE = int(os.environ.get("LOG_MIN_SCORE", "60"))
 # Cate semnale se trimit pe Telegram per bara. Jurnalul le primeste pe TOATE;
 # limita e doar ca o bara aglomerata sa nu trimita 10 mesaje deodata.
 TG_MAX_PER_BAR = int(os.environ.get("TG_MAX_PER_BAR", "3"))
@@ -1388,18 +1394,35 @@ def push_signals(rows, replace=False):
         return False
 
 
-def load_signals():
-    """Citește jurnalul de semnale din cloud."""
+def load_signals(pending_only=False):
+    """Citește jurnalul de semnale din cloud.
+    pending_only → doar cele nerezolvate (jurnalul întreg ajunge la MB)."""
     if not SIGNALS_URL or not ALERTS_KEY:
         return []
     try:
-        r = requests.get(SIGNALS_URL, headers={"x-ci-key": ALERTS_KEY}, timeout=20)
+        url = SIGNALS_URL + ("?pending=1" if pending_only else "")
+        r = requests.get(url, headers={"x-ci-key": ALERTS_KEY}, timeout=25)
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, list) else []
     except Exception as e:
         log.warning(f"Nu am putut citi jurnalul de semnale: {e}")
         return []
+
+
+def patch_signals(rows):
+    """Actualizează DOAR rezultatele, după id — nu reîncarcă tot jurnalul."""
+    if not SIGNALS_URL or not ALERTS_KEY or not rows:
+        return False
+    try:
+        r = requests.post(SIGNALS_URL + "?mode=patch",
+                          headers={"x-ci-key": ALERTS_KEY, "Content-Type": "application/json"},
+                          json=rows, timeout=25)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.error(f"Nu am putut actualiza rezultatele in jurnal: {e}")
+        return False
 
 
 def scan_universe():
@@ -1459,7 +1482,9 @@ def scan_universe():
 
     rows, alerted = [], 0
     for rank, ev in enumerate(evals, start=1):
-        if ev["score_adj"] < MIN_SCORE:
+        # Logam de la LOG_MIN_SCORE in sus (date pentru testul de separare);
+        # pe Telegram trimitem doar de la MIN_SCORE in sus.
+        if ev["score_adj"] < LOG_MIN_SCORE:
             break                                  # sortat desc — restul sunt sub prag
         below = sum(1 for a in adj if a < ev["score_adj"])
         cs, d = ev["cs"], ev["cs"]["dir"]
@@ -1475,9 +1500,10 @@ def scan_universe():
             "rank": rank, "uniTotal": n, "uniPct": round(100.0 * below / n, 1),
             "uniMedian": round(median, 1),
         })
-        # Telegram doar pentru primele TG_MAX_PER_BAR, ca o bară aglomerată să nu
-        # trimită 10 mesaje deodată. Jurnalul le primește pe TOATE.
-        if alerted < TG_MAX_PER_BAR:
+        # Telegram doar pentru cele peste MIN_SCORE și doar primele
+        # TG_MAX_PER_BAR, ca o bară aglomerată să nu trimită 10 mesaje deodată.
+        # Jurnalul primește tot ce e peste LOG_MIN_SCORE.
+        if ev["score_adj"] >= MIN_SCORE and alerted < TG_MAX_PER_BAR:
             uni_info = {"uni_rank": rank, "uni_total": n,
                         "uni_pct": 100.0 * below / n, "uni_median": median,
                         "score_adj": ev["score_adj"], "cost_r": ev["cost_r"],
@@ -1490,9 +1516,11 @@ def scan_universe():
 
     if rows:
         push_signals(rows)
-        log.info(f"UNIVERS: {len(rows)} semnale logate, {alerted} trimise pe Telegram")
+        log.info(f"UNIVERS: {len(rows)} semnale logate (prag {LOG_MIN_SCORE}), "
+                 f"{alerted} trimise pe Telegram (prag {MIN_SCORE})")
     else:
-        log.info(f"UNIVERS: niciun semnal peste pragul {MIN_SCORE} (max adj={adj[-1]:.0f})")
+        log.info(f"UNIVERS: niciun semnal peste pragul de logare {LOG_MIN_SCORE} "
+                 f"(max adj={adj[-1]:.0f})")
 
 
 def resolve_open_signals():
@@ -1508,8 +1536,7 @@ def resolve_open_signals():
     """
     if not SIGNALS_URL or not ALERTS_KEY:
         return
-    log_rows = load_signals()
-    pending = [s for s in log_rows if s.get("res") in (None, "")]
+    pending = load_signals(pending_only=True)
     if not pending:
         return
 
@@ -1518,7 +1545,7 @@ def resolve_open_signals():
     tf_min = _IV_SEC.get(EXEC_TF, 14400) / 60
     time_stop = max(6, round(16 / math.sqrt(tf_min / 15)))
 
-    changed = 0
+    resolved = []
     by_sym = {}
     for s in pending:
         by_sym.setdefault(s["sym"], []).append(s)
@@ -1567,21 +1594,17 @@ def resolve_open_signals():
             if not res:
                 continue   # încă în desfășurare
             move = ((exit_px - entry) / entry) * d
-            s["res"] = res
-            s["exitPx"] = exit_px
-            s["exitTs"] = exit_ts
             # R net: profit parțial + restul, minus costul intrării (full) și al ieșirii (rest)
-            s["rMultiple"] = round(
-                banked + rem * move / sl_pct - cost / sl_pct - rem * cost / sl_pct, 4)
-            changed += 1
+            r_mult = round(banked + rem * move / sl_pct - cost / sl_pct - rem * cost / sl_pct, 4)
+            resolved.append({"id": s["id"], "res": res, "exitPx": exit_px,
+                             "exitTs": exit_ts, "rMultiple": r_mult})
 
-    if changed:
-        push_signals(log_rows, replace=True)
-        done = [s for s in log_rows if s.get("res")]
-        wins = [s for s in done if (s.get("rMultiple") or 0) > 0]
-        log.info(f"JURNAL: {changed} semnale rezolvate | total incheiate {len(done)}"
-                 f" | WR {100*len(wins)/len(done):.0f}%"
-                 f" | suma {sum(s.get('rMultiple') or 0 for s in done):+.2f} R")
+    if resolved:
+        patch_signals(resolved)
+        wins = [s for s in resolved if s["rMultiple"] > 0]
+        log.info(f"JURNAL: {len(resolved)} semnale rezolvate"
+                 f" | WR in lotul asta {100*len(wins)/len(resolved):.0f}%"
+                 f" | suma {sum(s['rMultiple'] for s in resolved):+.2f} R")
 
 
 def load_watchlist_cloud():

@@ -57,13 +57,15 @@ jobs:
           WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
           ALERTS_KEY: ${{ secrets.ALERTS_KEY }}
           SIGNALS_URL: ${{ secrets.SIGNALS_URL }}
-          # Forward test: scanam top-200 perps o data per bara de 4h si logam
-          # ORICE semnal peste prag. ~4.5/zi => ~400 tranzactii in ~3 luni,
-          # minimul ca sa distingi edge de zgomot. Telegram primeste doar top 3
-          # per bara; jurnalul le primeste pe toate.
+          # Forward test pe top-200 perps, o trecere per bara de 4h.
+          # LOG_MIN_SCORE (60) e DELIBERAT sub MIN_SCORE (75): logam si semnale
+          # mediocre ca sa putem testa daca scorul SEPARA in general — daca un 85
+          # nu bate un 62, niciun prag nu conteaza. Ambele alese INAINTE de a
+          # vedea vreun rezultat; nu se modifica dupa (altfel e p-hacking).
           UNIVERSE_SIZE: "200"
+          LOG_MIN_SCORE: "60"
           TG_MAX_PER_BAR: "3"
-          MIN_SCORE: "80"
+          MIN_SCORE: "75"
           SCAN_INTERVAL_SEC: "300"
           MAX_RUNTIME_SEC: "20700"   # 5h45m
           SFP_SYMBOLS: "DOGEUSDT,SOLUSDT"
