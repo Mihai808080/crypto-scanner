@@ -56,6 +56,13 @@ jobs:
           ALERTS_URL: ${{ secrets.ALERTS_URL }}
           WATCHLIST_URL: ${{ secrets.WATCHLIST_URL }}
           ALERTS_KEY: ${{ secrets.ALERTS_KEY }}
+          SIGNALS_URL: ${{ secrets.SIGNALS_URL }}
+          # Forward test: scanam top-200 perps o data per bara de 4h si logam
+          # ORICE semnal peste prag. ~4.5/zi => ~400 tranzactii in ~3 luni,
+          # minimul ca sa distingi edge de zgomot. Telegram primeste doar top 3
+          # per bara; jurnalul le primeste pe toate.
+          UNIVERSE_SIZE: "200"
+          TG_MAX_PER_BAR: "3"
           MIN_SCORE: "80"
           SCAN_INTERVAL_SEC: "300"
           MAX_RUNTIME_SEC: "20700"   # 5h45m

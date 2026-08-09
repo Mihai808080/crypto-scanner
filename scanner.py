@@ -11,6 +11,7 @@ Nu necesită telefonul sau dashboard-ul deschis — rulează pe server.
 import os
 import time
 import json
+import math
 import logging
 from datetime import datetime, timezone
 import requests
@@ -53,6 +54,16 @@ ALERTS_KEY = os.environ.get("ALERTS_KEY", "")
 # Watchlist din cloud (Netlify Blobs) — listă de {sym, cat, strat} scrisă din UI.
 # Gol → fallback la watchlist.txt (toate pe strategia 'conf').
 WATCHLIST_URL = os.environ.get("WATCHLIST_URL", "")
+# Jurnal de semnale (forward test) — https://<site>.netlify.app/api/signals.
+# Gol → scanul de univers nu logheaza nimic (dar tot ruleaza).
+SIGNALS_URL = os.environ.get("SIGNALS_URL", "")
+# Cate monede intra in universul scanat pentru forward test (0 = dezactivat).
+# 200 nu e ales estetic: la ~4.5 semnale/zi, ~400 de tranzactii (minimul ca sa
+# distingi edge de zgomot) se aduna in ~3 luni. Pe 4 monede ar dura ~12 ani.
+UNIVERSE_SIZE = int(os.environ.get("UNIVERSE_SIZE", "200"))
+# Cate semnale se trimit pe Telegram per bara. Jurnalul le primeste pe TOATE;
+# limita e doar ca o bara aglomerata sa nu trimita 10 mesaje deodata.
+TG_MAX_PER_BAR = int(os.environ.get("TG_MAX_PER_BAR", "3"))
 # Fișier de stare persistat între rulări (anti-spam). Pe GitHub Actions e
 # restaurat/salvat prin actions/cache; local e doar un fișier lângă scanner.
 STATE_FILE = os.environ.get("STATE_FILE", "scan_state.json")
@@ -79,6 +90,7 @@ MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "0"))
 # Anti-spam: ultima direcție/alertă trimisă per simbol
 state = {}  # { "BTCUSDT": {"prev_dir": 0, "last_alert_ts": 0} }
 sweep_state = {}  # anti-spam separat pentru alertele de Liquidity Sweep
+uni_state = {}    # {"last_bar": n} — scanul de univers ruleaza o data per bara
 
 
 # ─────────────────────────────────────────────
@@ -93,6 +105,7 @@ def load_state():
             data = json.load(f)
         state.update(data.get("confluence", {}))
         sweep_state.update(data.get("sweep", {}))
+        uni_state.update(data.get("universe", {}))
         sfp._alerted.update(data.get("sfp", {}))
         log.info(f"Stare încărcată din {STATE_FILE}")
     except Exception as e:
@@ -103,7 +116,8 @@ def save_state():
     """Salvează starea anti-spam în STATE_FILE."""
     try:
         with open(STATE_FILE, "w") as f:
-            json.dump({"confluence": state, "sweep": sweep_state, "sfp": sfp._alerted}, f)
+            json.dump({"confluence": state, "sweep": sweep_state,
+                       "universe": uni_state, "sfp": sfp._alerted}, f)
     except Exception as e:
         log.error(f"Nu am putut salva starea: {e}")
 
@@ -326,6 +340,76 @@ def bybit_funding_oi(symbol):
     except Exception as e:
         log.info(f"{symbol}: funding/OI Bybit indisponibil ({e})")
         return None
+
+
+# ─────────────────────────────────────────────
+# BYBIT — sursă unică pentru scanul de UNIVERS (forward test)
+# Un singur apel /tickers dă, pentru toate cele ~700 de perps: turnover 24h
+# (pt clasare), bid/ask (pt cost real), funding și open interest. Klines-urile
+# vin tot de la Bybit, deci prețul, costul și funding-ul sunt de pe ACELAȘI
+# venue — cel pe care s-ar executa efectiv un trade cu levier.
+# ─────────────────────────────────────────────
+_BYBIT_IV = {"1m": "1", "5m": "5", "15m": "15", "30m": "30",
+             "1h": "60", "4h": "240", "1d": "D"}
+
+
+def bybit_universe(top_n=200, min_turnover=1e6):
+    """Top-N perps USDT după turnover 24h. Întoarce listă de dict-uri cu tot ce
+    trebuie pentru scor + cost, dintr-un singur apel."""
+    r = _get(f"{BYBIT_BASE}/tickers", {"category": "linear"}, timeout=25)
+    rows = (r.json().get("result") or {}).get("list") or []
+    out = []
+    for x in rows:
+        sym = x.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        try:
+            turnover = float(x.get("turnover24h") or 0)
+            bid, ask = float(x.get("bid1Price") or 0), float(x.get("ask1Price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if turnover < min_turnover or bid <= 0 or ask < bid:
+            continue
+        mid = (bid + ask) / 2
+        try:
+            funding = float(x["fundingRate"]) if x.get("fundingRate") not in (None, "") else None
+        except (TypeError, ValueError):
+            funding = None
+        out.append({
+            "sym": sym,
+            "turnover": turnover,
+            # slippage estimat pe un leg = jumătate din spread
+            "slip": (ask - bid) / mid / 2 if mid else 0.001,
+            "funding": funding,
+        })
+    out.sort(key=lambda d: d["turnover"], reverse=True)
+    return out[:top_n]
+
+
+def bybit_klines(symbol, interval, limit):
+    """Klines Bybit linear, cronologic. Bybit le dă cel mai recent primul.
+    Nu expune taker-buy volume → 'tb' neutru (CVD nu inventează direcție)."""
+    iv = _BYBIT_IV.get(interval)
+    if not iv:
+        raise ValueError(f"interval nesuportat pe Bybit: {interval}")
+    r = _get(f"{BYBIT_BASE}/kline",
+             {"category": "linear", "symbol": symbol, "interval": iv, "limit": min(1000, limit)})
+    rows = (r.json().get("result") or {}).get("list") or []
+    if not rows:
+        raise ValueError(f"Bybit fără lumânări pentru {symbol} {interval}")
+    rows = sorted(rows, key=lambda k: int(k[0]))
+    out = []
+    for k in rows:
+        v = float(k[5])
+        out.append({"t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+                    "c": float(k[4]), "v": v, "tb": v / 2})
+    return out[-limit:]
+
+
+def bybit_closed_klines(symbol, interval, limit):
+    """Lumânări ÎNCHISE de la Bybit — aceeași regulă ca peste tot."""
+    kl = closed_bars(bybit_klines(symbol, interval, limit + 1), interval)
+    return kl[-limit:]
 
 
 _slip_cache = {}  # symbol -> (ts, slip) — spread-ul nu se schimbă de la minut la minut
@@ -1283,6 +1367,223 @@ def check_price_alerts():
             log.error(f"Nu am putut actualiza alertele în cloud: {e}")
 
 
+# ─────────────────────────────────────────────
+# JURNAL DE SEMNALE + SCAN DE UNIVERS (forward test)
+# Scopul e MĂSURAREA, nu tranzacționarea: logăm orb fiecare semnal, cu toți
+# parametrii de intrare, ca peste luni să putem calcula PF/WR pe date pe care
+# nu le-am ales retroactiv. Fără asta, orice concluzie e selecție post-hoc.
+# ─────────────────────────────────────────────
+def push_signals(rows, replace=False):
+    """Adaugă (sau înlocuiește) intrări în jurnalul din cloud."""
+    if not SIGNALS_URL or not ALERTS_KEY or not rows:
+        return False
+    url = SIGNALS_URL + ("" if replace else "?mode=append")
+    try:
+        r = requests.post(url, headers={"x-ci-key": ALERTS_KEY, "Content-Type": "application/json"},
+                          json=rows, timeout=20)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        log.error(f"Nu am putut scrie in jurnalul de semnale: {e}")
+        return False
+
+
+def load_signals():
+    """Citește jurnalul de semnale din cloud."""
+    if not SIGNALS_URL or not ALERTS_KEY:
+        return []
+    try:
+        r = requests.get(SIGNALS_URL, headers={"x-ci-key": ALERTS_KEY}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        log.warning(f"Nu am putut citi jurnalul de semnale: {e}")
+        return []
+
+
+def scan_universe():
+    """O trecere peste tot universul, o singură dată per bară EXEC_TF.
+
+    Nu se rulează la fiecare 5 minute: pe bare de 4h ar fi de 48 de ori degeaba
+    (și ~19k cereri inutile pe zi). Bara curentă se deduce din ceas.
+    """
+    if not UNIVERSE_SIZE:
+        return
+    step = _IV_SEC.get(EXEC_TF, 14400)
+    cur_bar = int(time.time() // step)
+    if uni_state.get("last_bar") == cur_bar:
+        return
+    uni_state["last_bar"] = cur_bar
+
+    try:
+        uni = bybit_universe(UNIVERSE_SIZE)
+    except Exception as e:
+        log.error(f"Nu am putut construi universul: {e}")
+        return
+    log.info(f"UNIVERS: scanez {len(uni)} monede pe {EXEC_TF}...")
+
+    evals = []
+    for d in uni:
+        sym = d["sym"]
+        try:
+            kl = bybit_closed_klines(sym, EXEC_TF, 200)
+            if len(kl) < 100:
+                continue
+            # pe 4h seria proprie E contextul de 4h (ca in StrategyLab)
+            kl4h = kl if EXEC_TF == "4h" else bybit_closed_klines(sym, "4h", 30)
+            kl1h = kl if EXEC_TF == "1h" else bybit_closed_klines(sym, "1h", 60)
+            price, bar_ts = kl[-1]["c"], kl[-1]["t"]
+            cs = compute_confluence_score(price, [k["c"] for k in kl], kl, kl1h, kl4h, bar_ts=bar_ts)
+            if cs["dir"] == 0:
+                continue
+            sl_pct = max(0.004, (cs.get("atr_pct") or 0.0035) * 1.2)
+            score_adj, cost_r = cost_adjust(cs["score"], sl_pct, d["slip"])
+            evals.append({"sym": sym, "cs": cs, "price": price, "bar_ts": bar_ts,
+                          "sl_pct": sl_pct, "score_adj": score_adj, "cost_r": cost_r,
+                          "slip": d["slip"], "funding": d["funding"], "kl": kl})
+        except Exception as e:
+            log.info(f"  {sym}: sarit ({e})")
+        time.sleep(0.15)   # politicos cu API-ul; Bybit permite mult mai mult
+
+    if not evals:
+        log.info("UNIVERS: nicio moneda cu directie — trecere goala")
+        return
+
+    evals.sort(key=lambda e: e["score_adj"], reverse=True)
+    adj = sorted(e["score_adj"] for e in evals)
+    n = len(adj)
+    median = adj[n // 2] if n % 2 else (adj[n // 2 - 1] + adj[n // 2]) / 2
+    top5 = ", ".join("{}={:.0f}".format(e["sym"], e["score_adj"]) for e in evals[:5])
+    log.info(f"UNIVERS: {n} evaluate | mediana adj={median:.0f} | top: {top5}")
+
+    rows, alerted = [], 0
+    for rank, ev in enumerate(evals, start=1):
+        if ev["score_adj"] < MIN_SCORE:
+            break                                  # sortat desc — restul sunt sub prag
+        below = sum(1 for a in adj if a < ev["score_adj"])
+        cs, d = ev["cs"], ev["cs"]["dir"]
+        rows.append({
+            "id": f"{ev['sym']}-{ev['bar_ts']}-conf",
+            "sym": ev["sym"], "ts": int(time.time() * 1000), "barTs": ev["bar_ts"],
+            "tf": EXEC_TF, "strat": "conf", "dir": d,
+            "score": cs["score"], "scoreAdj": round(ev["score_adj"], 2),
+            "costR": round(ev["cost_r"], 4), "slipEst": round(ev["slip"], 6),
+            "entry": ev["price"], "slPct": round(ev["sl_pct"], 6),
+            "tp1Pct": round(ev["sl_pct"] * 1.5, 6), "tp2Pct": round(ev["sl_pct"] * 3, 6),
+            "tp3Pct": round(ev["sl_pct"] * 5, 6),
+            "rank": rank, "uniTotal": n, "uniPct": round(100.0 * below / n, 1),
+            "uniMedian": round(median, 1),
+        })
+        # Telegram doar pentru primele TG_MAX_PER_BAR, ca o bară aglomerată să nu
+        # trimită 10 mesaje deodată. Jurnalul le primește pe TOATE.
+        if alerted < TG_MAX_PER_BAR:
+            uni_info = {"uni_rank": rank, "uni_total": n,
+                        "uni_pct": 100.0 * below / n, "uni_median": median,
+                        "score_adj": ev["score_adj"], "cost_r": ev["cost_r"],
+                        "btc_dir": btc_trend_dir()}
+            if ev["funding"] is not None:
+                uni_info["funding"] = ev["funding"]
+            msg = build_alert_message(ev["sym"], cs, ev["price"], kl15=ev["kl"], extras=uni_info)
+            if send_telegram(msg):
+                alerted += 1
+
+    if rows:
+        push_signals(rows)
+        log.info(f"UNIVERS: {len(rows)} semnale logate, {alerted} trimise pe Telegram")
+    else:
+        log.info(f"UNIVERS: niciun semnal peste pragul {MIN_SCORE} (max adj={adj[-1]:.0f})")
+
+
+def resolve_open_signals():
+    """Stabilește rezultatul semnalelor logate care s-au încheiat între timp.
+
+    Folosește EXACT modelul din backtest_reference.py — altfel cifrele n-ar fi
+    comparabile cu distribuția null măsurată acolo:
+      • managementul începe pe PRIMA bară de după intrare (fără bară sărită)
+      • TP1 închide 50%; restul merge la SL / TP2 / time-stop
+      • worst-case: dacă o bară atinge și SL, și TP → iese pe SL cu tot
+      • fees + slippage pe fiecare leg
+    Rezultatul e exprimat în R (unități de risc), net de costuri.
+    """
+    if not SIGNALS_URL or not ALERTS_KEY:
+        return
+    log_rows = load_signals()
+    pending = [s for s in log_rows if s.get("res") in (None, "")]
+    if not pending:
+        return
+
+    step = _IV_SEC.get(EXEC_TF, 14400) * 1000
+    # Același time-stop ca în backtest: max(6, round(16/sqrt(tf/15)))
+    tf_min = _IV_SEC.get(EXEC_TF, 14400) / 60
+    time_stop = max(6, round(16 / math.sqrt(tf_min / 15)))
+
+    changed = 0
+    by_sym = {}
+    for s in pending:
+        by_sym.setdefault(s["sym"], []).append(s)
+
+    for sym, sigs in by_sym.items():
+        # Nu cerem klines decât dacă măcar un semnal poate fi deja încheiat.
+        oldest = min(s["barTs"] for s in sigs)
+        if time.time() * 1000 - oldest < step * 1.5:
+            continue
+        try:
+            kl = bybit_closed_klines(sym, EXEC_TF, 200)
+        except Exception as e:
+            log.info(f"  resolve {sym}: klines indisponibile ({e})")
+            continue
+        for s in sigs:
+            after = [k for k in kl if k["t"] > s["barTs"]]
+            if not after:
+                continue
+            d = s["dir"]
+            entry, sl_pct = s["entry"], s["slPct"]
+            tp1_pct, tp2_pct = s["tp1Pct"], s["tp2Pct"]
+            cost = FEE_PER_SIDE + (s.get("slipEst") or 0)
+            sl = entry * (1 - sl_pct) if d == 1 else entry * (1 + sl_pct)
+            tp1 = entry * (1 + tp1_pct) if d == 1 else entry * (1 - tp1_pct)
+            tp2 = entry * (1 + tp2_pct) if d == 1 else entry * (1 - tp2_pct)
+
+            tp1hit, banked, rem = False, 0.0, 1.0
+            res = exit_px = exit_ts = None
+            for i, bar in enumerate(after, start=1):
+                is_l = d == 1
+                hit_sl = (bar["l"] <= sl) if is_l else (bar["h"] >= sl)
+                hit_tp1 = (bar["h"] >= tp1) if is_l else (bar["l"] <= tp1)
+                hit_tp2 = (bar["h"] >= tp2) if is_l else (bar["l"] <= tp2)
+                if (not tp1hit) and hit_tp1 and (not hit_sl):
+                    tp1hit = True
+                    banked = 0.5 * (tp1_pct - cost) / sl_pct   # în R
+                    rem = 0.5
+                if hit_sl:
+                    res, exit_px, exit_ts = "SL", sl, bar["t"]
+                elif hit_tp2:
+                    res, exit_px, exit_ts = "TP2", tp2, bar["t"]
+                elif i >= time_stop:
+                    res, exit_px, exit_ts = "TIME", bar["c"], bar["t"]
+                if res:
+                    break
+            if not res:
+                continue   # încă în desfășurare
+            move = ((exit_px - entry) / entry) * d
+            s["res"] = res
+            s["exitPx"] = exit_px
+            s["exitTs"] = exit_ts
+            # R net: profit parțial + restul, minus costul intrării (full) și al ieșirii (rest)
+            s["rMultiple"] = round(
+                banked + rem * move / sl_pct - cost / sl_pct - rem * cost / sl_pct, 4)
+            changed += 1
+
+    if changed:
+        push_signals(log_rows, replace=True)
+        done = [s for s in log_rows if s.get("res")]
+        wins = [s for s in done if (s.get("rMultiple") or 0) > 0]
+        log.info(f"JURNAL: {changed} semnale rezolvate | total incheiate {len(done)}"
+                 f" | WR {100*len(wins)/len(done):.0f}%"
+                 f" | suma {sum(s.get('rMultiple') or 0 for s in done):+.2f} R")
+
+
 def load_watchlist_cloud():
     """Watchlist din cloud (Netlify Blobs) — listă de {sym, strat}.
     Fallback la watchlist.txt (toate pe 'conf') dacă nu e configurat/gol."""
@@ -1339,6 +1640,18 @@ def scan_pass():
     for sym in SFP_SYMBOLS:
         sfp.scan_sfp(sym, send_telegram)
         time.sleep(1)
+
+    # Forward test: scanul universului (o dată per bară) + evaluarea semnalelor
+    # deja logate. Ambele sunt izolate în try — o problemă aici nu trebuie să
+    # oprească alertele de preț sau watchlist-ul userului.
+    try:
+        scan_universe()
+    except Exception as e:
+        log.error(f"scan_universe a esuat: {e}")
+    try:
+        resolve_open_signals()
+    except Exception as e:
+        log.error(f"resolve_open_signals a esuat: {e}")
 
 
 def main():
