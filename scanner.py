@@ -1434,13 +1434,16 @@ def scan_universe():
     cur_bar = int(time.time() // step)
     if uni_state.get("last_bar") == cur_bar:
         return
-    uni_state["last_bar"] = cur_bar
-
+    # ATENȚIE: bara se marchează ca scanată DOAR după ce scanul chiar reușește.
+    # Marcând-o înainte, o eroare trecătoare (rate-limit, 403, retea) pierdea
+    # bara definitiv — nicio rulare ulterioară nu mai reincerca pana la ora
+    # urmatoare. Exact asa s-a pierdut bara de 16:00 la primul deploy.
     try:
         uni = build_universe(UNIVERSE_SIZE)
     except Exception as e:
-        log.error(f"Nu am putut construi universul: {e}")
+        log.error(f"Nu am putut construi universul: {e} — reincerc la trecerea urmatoare")
         return
+    uni_state["last_bar"] = cur_bar
     log.info(f"UNIVERS: scanez {len(uni)} monede pe {EXEC_TF}...")
 
     evals = []
